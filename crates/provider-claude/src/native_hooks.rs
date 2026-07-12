@@ -730,7 +730,7 @@ fn required_string(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::PathBuf;
 
     use serde_json::{Value, json};
 
@@ -741,12 +741,29 @@ mod tests {
         user_prompt_submit_additional_context,
     };
 
+    fn test_cwd() -> PathBuf {
+        std::env::current_dir()
+            .and_then(|path| path.canonicalize())
+            .expect("test working directory should be an absolute, existing path")
+    }
+
+    fn test_transcript_path() -> PathBuf {
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("system temporary directory should be an absolute, existing path")
+            .join("agentctl-claude-session.jsonl")
+    }
+
+    fn test_executable() -> PathBuf {
+        std::env::current_exe().expect("test executable should have an absolute path")
+    }
+
     fn common(event: &str) -> Value {
         json!({
             "session_id": "claude-session",
             "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
-            "transcript_path": "/tmp/claude-session.jsonl",
-            "cwd": "/repo",
+            "transcript_path": test_transcript_path(),
+            "cwd": test_cwd(),
             "permission_mode": "default",
             "hook_event_name": event,
         })
@@ -763,7 +780,7 @@ mod tests {
 
     fn command() -> NativeHookCommand {
         NativeHookCommand::new(
-            Path::new("/usr/local/bin/agentctl"),
+            test_executable(),
             vec!["native-hook".to_owned(), "ingest".to_owned()],
             10,
         )
@@ -783,7 +800,12 @@ mod tests {
                 "Notification": [{"hooks": [{"type": "command", "command": "/opt/ping"}]}]
             }
         });
-        let merged = merge_interactive_hook_settings(Some(&existing), &command()).unwrap();
+        let command = command();
+        let expected_command = command
+            .executable()
+            .to_str()
+            .expect("test executable path should be valid UTF-8");
+        let merged = merge_interactive_hook_settings(Some(&existing), &command).unwrap();
 
         assert_eq!(merged["model"], "opus");
         assert_eq!(merged["permissions"], existing["permissions"]);
@@ -799,7 +821,7 @@ mod tests {
             let groups = merged["hooks"][event].as_array().unwrap();
             let handler = groups.last().unwrap()["hooks"][0].as_object().unwrap();
             assert_eq!(handler["type"], "command");
-            assert_eq!(handler["command"], "/usr/local/bin/agentctl");
+            assert_eq!(handler["command"], expected_command);
             assert_eq!(handler["args"], json!(["native-hook", "ingest"]));
             assert_eq!(handler["timeout"], 10);
             assert!(handler.get("shell").is_none());
@@ -820,7 +842,7 @@ mod tests {
         assert!(matches!(error, NativeHookError::InvalidSettings(_)));
         let error = NativeHookCommand::new("agentctl", Vec::new(), 10).unwrap_err();
         assert!(matches!(error, NativeHookError::InvalidSettings(_)));
-        let error = NativeHookCommand::new("/bin/agentctl", Vec::new(), 0).unwrap_err();
+        let error = NativeHookCommand::new(test_executable(), Vec::new(), 0).unwrap_err();
         assert!(matches!(error, NativeHookError::InvalidSettings(_)));
     }
 
@@ -843,7 +865,7 @@ mod tests {
         assert_eq!(event.source, SessionStartSource::Resume);
         assert_eq!(event.model.as_deref(), Some("claude-opus-4"));
         assert_eq!(event.common.permission_mode, Some(PermissionMode::Manual));
-        assert_eq!(event.common.cwd, Path::new("/repo"));
+        assert_eq!(event.common.cwd, test_cwd());
     }
 
     #[test]
