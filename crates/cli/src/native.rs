@@ -8,9 +8,10 @@ use std::{
 use agentctl_core::ProviderKind;
 use agentctl_provider_claude::HANDOFF_POLICY;
 use agentctl_workspace::{
-    ProcessGroupId, ProcessTree, configure_tokio_process_group, kill_process_group,
-    process_group_exists, process_root_exists, terminate_process_group,
+    ProcessGroupId, ProcessTree, configure_tokio_process_group, process_root_exists,
 };
+#[cfg(unix)]
+use agentctl_workspace::{kill_process_group, process_group_exists, terminate_process_group};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tokio::process::{Child, Command};

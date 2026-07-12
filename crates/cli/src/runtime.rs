@@ -578,10 +578,9 @@ mod tests {
         ProviderStatus, SessionContext, SessionStatus, SideEffectState, SyncBatch, SyncReceipt,
         TurnId, TurnRequest, TurnStatus, UnifiedSession, UnifiedSessionId,
     };
-    use agentctl_storage::{
-        NativeHandoffState, NativeLaunchState, ProviderSessionRecord, TurnRecord,
-        canonical_content_hash,
-    };
+    #[cfg(unix)]
+    use agentctl_storage::{NativeHandoffState, NativeLaunchState, ProviderSessionRecord};
+    use agentctl_storage::{TurnRecord, canonical_content_hash};
     use agentctl_workspace::WorkspaceIdentity;
     use async_trait::async_trait;
     use chrono::Utc;

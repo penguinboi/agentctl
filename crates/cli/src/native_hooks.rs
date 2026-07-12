@@ -2642,7 +2642,9 @@ pub(crate) fn parse_claude_semver(value: &str) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use agentctl_core::{AuthMode, NativeSession, SessionStatus};
+    #[cfg(unix)]
+    use agentctl_core::NativeSession;
+    use agentctl_core::{AuthMode, SessionStatus};
     use agentctl_provider_claude::native_hooks::parse_hook_payload;
     use agentctl_telemetry::{PayloadLimits, RedactionConfig, Redactor};
     use tempfile::TempDir;
