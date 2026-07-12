@@ -350,18 +350,29 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_job_close_terminates_attached_child() {
-        let mut command = tokio::process::Command::new("cmd.exe");
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
         command
-            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .args([
+                "--exact",
+                "process_group::tests::windows_long_lived_child",
+                "--ignored",
+            ])
             .kill_on_drop(true);
         let mut child = command.spawn().unwrap();
         let tree = ProcessTree::attach(&child).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
 
         drop(tree);
-        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
             .await
             .unwrap()
             .unwrap();
-        assert!(!status.success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawned by windows_job_close_terminates_attached_child"]
+    fn windows_long_lived_child() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
     }
 }
