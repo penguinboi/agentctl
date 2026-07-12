@@ -4,7 +4,7 @@ use std::{
 };
 
 #[derive(Clone, Debug)]
-pub struct AgentctlPaths {
+pub(crate) struct AgentctlPaths {
     pub home: PathBuf,
     pub database: PathBuf,
     pub blobs: PathBuf,
@@ -16,7 +16,7 @@ pub struct AgentctlPaths {
 }
 
 impl AgentctlPaths {
-    pub fn resolve(override_home: Option<PathBuf>) -> io::Result<Self> {
+    pub(crate) fn resolve(override_home: Option<PathBuf>) -> io::Result<Self> {
         let home = if let Some(home) = override_home {
             home
         } else if let Some(home) = std::env::var_os("AGENTCTL_HOME") {
@@ -41,7 +41,7 @@ impl AgentctlPaths {
         Ok(paths)
     }
 
-    pub fn ensure(&self) -> io::Result<()> {
+    pub(crate) fn ensure(&self) -> io::Result<()> {
         ensure_private_directory(&self.home, true)?;
         for path in [
             &self.blobs,
@@ -64,7 +64,7 @@ impl AgentctlPaths {
     }
 
     /// Root for installed-version Codex protocol schemas owned by this agentctl home.
-    pub fn codex_protocol_root(&self) -> PathBuf {
+    pub(crate) fn codex_protocol_root(&self) -> PathBuf {
         self.protocols.join("codex")
     }
 }

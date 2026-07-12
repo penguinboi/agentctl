@@ -46,7 +46,7 @@ use crate::{
 const MAX_NATIVE_PROVIDER_ATTEMPTS: usize = 2;
 
 #[allow(clippy::too_many_lines)]
-pub async fn dispatch(cli: Cli) -> Result<()> {
+pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
     // Reject unsafe forwarding before resolving paths, opening/migrating the
     // database, applying retention, creating a session, probing providers, or
     // reconciling an earlier native launch.
@@ -240,7 +240,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             )?;
             let runtime = build_runtime(store, paths, config, session).await?;
             let result = runtime.sync_all().await;
-            let value = finish_runtime(&runtime, None, result).await?;
+            let value = finish_runtime(&runtime, result).await?;
             print_value(&value, cli.json)
         }
         Some(Command::Fork(args)) => {
@@ -1267,7 +1267,7 @@ async fn run_native_codex(
     let prepared = runtime
         .prepare_native_projection(&ProviderKind::Codex)
         .await;
-    let native_session = finish_runtime(&runtime, None, prepared).await?;
+    let native_session = finish_runtime(&runtime, prepared).await?;
     let thread_baseline = snapshot_codex_threads(paths, config, identity).await?;
     store.update_session_routing(
         session.id,
@@ -1555,14 +1555,7 @@ async fn capture_codex_native_history(
     }
 }
 
-async fn finish_runtime<T>(
-    runtime: &Runtime,
-    approval_task: Option<tokio::task::JoinHandle<()>>,
-    result: Result<T>,
-) -> Result<T> {
-    if let Some(task) = approval_task {
-        task.abort();
-    }
+async fn finish_runtime<T>(runtime: &Runtime, result: Result<T>) -> Result<T> {
     let shutdown = runtime.shutdown().await;
     match (result, shutdown) {
         (Ok(value), Ok(())) => Ok(value),

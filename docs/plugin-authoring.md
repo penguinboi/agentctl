@@ -7,8 +7,12 @@
 
 Provider plugins are executables speaking versioned JSON-RPC/JSONL over stdio.
 They negotiate capabilities during `initialize`; Rust dynamic-library ABI is
-not part of the public contract. See the generated schemas and the
-`agentctl-plugin-protocol` crate for message definitions.
+not part of the public contract. Message definitions live in the
+`agentctl-plugin-protocol` crate. A source consumer can call
+`protocol_schema_bundle()` or `write_protocol_schema(path)` to generate the
+exact JSON Schema bundle for that checkout. No standalone schema file is
+currently shipped as a stable compatibility promise while this extension
+surface remains experimental.
 
 ## Manifest
 

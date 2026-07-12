@@ -6,10 +6,9 @@ use std::{
 };
 
 use agentctl_core::{
-    ApprovalDecision, ApprovalId, ApprovalRequest, AuthMode, CanonicalEvent, EventId,
-    EventVisibility, ProviderHealth, ProviderKind, ProviderSessionId, ProviderStatus,
-    RoutingDecision, SessionStatus, SideEffectState, TurnId, TurnStatus, UnifiedSession,
-    UnifiedSessionId,
+    AuthMode, CanonicalEvent, EventId, EventVisibility, ProviderHealth, ProviderKind,
+    ProviderSessionId, ProviderStatus, SessionStatus, SideEffectState, TurnId, TurnStatus,
+    UnifiedSession, UnifiedSessionId,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{
@@ -309,14 +308,6 @@ pub struct ProjectionRebuildResult {
     pub pending_intents_removed: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SessionBranchRecord {
-    pub child_session_id: UnifiedSessionId,
-    pub parent_session_id: UnifiedSessionId,
-    pub through_seq: u64,
-    pub created_at: DateTime<Utc>,
-}
-
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -340,8 +331,9 @@ impl SqliteStore {
         &self.path
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn with_limits(mut self, limits: StorageLimits) -> Self {
+    fn with_limits(mut self, limits: StorageLimits) -> Self {
         self.limits = limits;
         self
     }
@@ -719,7 +711,8 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
-    pub fn latest_open_native_launch(
+    #[cfg(test)]
+    fn latest_open_native_launch(
         &self,
         session_id: UnifiedSessionId,
         provider: &ProviderKind,
@@ -980,20 +973,6 @@ impl SqliteStore {
             ],
         )?;
         Ok(())
-    }
-
-    /// Assigns the single executor selected for a pending turn. Once assigned,
-    /// the provider cannot be changed; failover creates a separate attempt.
-    pub fn assign_turn_provider(&self, id: TurnId, provider: &ProviderKind) -> Result<()> {
-        let connection = self.connection()?;
-        expect_one(
-            connection.execute(
-                "UPDATE turns SET provider_json = ?2, updated_at = ?3
-                 WHERE id = ?1 AND provider_json IS NULL AND status_json = '\"pending\"'",
-                params![id.to_string(), encode(provider)?, timestamp(Utc::now())],
-            )?,
-            format!("unassigned pending turn {id}"),
-        )
     }
 
     pub fn update_turn_state(
@@ -1676,19 +1655,6 @@ impl SqliteStore {
         })
     }
 
-    pub fn record_sync_receipt(
-        &self,
-        provider_session_id: ProviderSessionId,
-        receipt: &SyncReceiptEntry,
-        through_seq: u64,
-    ) -> Result<SyncWriteResult> {
-        self.record_sync_receipts(
-            provider_session_id,
-            std::slice::from_ref(receipt),
-            through_seq,
-        )
-    }
-
     pub fn has_sync_receipt(
         &self,
         provider_session_id: ProviderSessionId,
@@ -1816,26 +1782,6 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
-    pub fn latest_workspace_snapshot(
-        &self,
-        session_id: UnifiedSessionId,
-        turn_id: Option<TurnId>,
-    ) -> Result<Option<WorkspaceSnapshotRecord>> {
-        let connection = self.connection()?;
-        connection
-            .query_row(
-                "SELECT id, session_id, turn_id, phase, fingerprint, snapshot_json,
-                        diff_digest, created_at
-                 FROM workspace_snapshots
-                 WHERE session_id = ?1 AND (?2 IS NULL OR turn_id = ?2)
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
-                params![session_id.to_string(), turn_id.map(|id| id.to_string())],
-                workspace_snapshot_from_row,
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
     pub fn record_checkpoint(&self, record: &ContextCheckpointRecord) -> Result<bool> {
         let connection = self.connection()?;
         let changed = connection.execute(
@@ -1884,82 +1830,6 @@ impl SqliteStore {
             .map_err(Into::into)
     }
 
-    pub fn record_routing_decision(
-        &self,
-        session_id: UnifiedSessionId,
-        turn_id: TurnId,
-        decision: &RoutingDecision,
-        created_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let connection = self.connection()?;
-        connection.execute(
-            "INSERT INTO routing_decisions (session_id, turn_id, decision_json, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                session_id.to_string(),
-                turn_id.to_string(),
-                encode(decision)?,
-                timestamp(created_at),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn create_approval(
-        &self,
-        request: &ApprovalRequest,
-        created_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let connection = self.connection()?;
-        connection.execute(
-            "INSERT INTO approvals
-             (id, session_id, turn_id, provider_json, request_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                request.id.to_string(),
-                request.session_id.to_string(),
-                request.turn_id.to_string(),
-                encode(&request.provider)?,
-                encode(request)?,
-                timestamp(created_at),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn decide_approval(
-        &self,
-        id: ApprovalId,
-        decision: ApprovalDecision,
-        decided_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let connection = self.connection()?;
-        expect_one(
-            connection.execute(
-                "UPDATE approvals SET decision_json = ?2, decided_at = ?3
-                 WHERE id = ?1 AND decision_json IS NULL",
-                params![id.to_string(), encode(&decision)?, timestamp(decided_at)],
-            )?,
-            format!("pending approval {id}"),
-        )
-    }
-
-    pub fn record_branch(&self, branch: &SessionBranchRecord) -> Result<()> {
-        let connection = self.connection()?;
-        connection.execute(
-            "INSERT INTO session_branches
-             (child_session_id, parent_session_id, through_seq, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                branch.child_session_id.to_string(),
-                branch.parent_session_id.to_string(),
-                branch.through_seq,
-                timestamp(branch.created_at),
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn record_protocol_capability(&self, record: &ProtocolCapabilityRecord) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(
@@ -1980,30 +1850,6 @@ impl SqliteStore {
             ],
         )?;
         Ok(())
-    }
-
-    pub fn protocol_capabilities(
-        &self,
-        provider: &ProviderKind,
-        native_version: &str,
-    ) -> Result<Vec<ProtocolCapabilityRecord>> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT provider_json, native_version, capability, supported, evidence_json, probed_at
-             FROM protocol_capabilities WHERE provider_json = ?1 AND native_version = ?2
-             ORDER BY capability",
-        )?;
-        let rows = statement.query_map(params![encode(provider)?, native_version], |row| {
-            Ok(ProtocolCapabilityRecord {
-                provider: decode_row(row.get::<_, String>(0)?, 0)?,
-                native_version: row.get(1)?,
-                capability: row.get(2)?,
-                supported: row.get(3)?,
-                evidence: decode_row(row.get::<_, String>(4)?, 4)?,
-                probed_at: parse_timestamp(row.get(5)?, 5)?,
-            })
-        })?;
-        collect_rows(rows)
     }
 
     pub fn register_blob(&self, blob: &BlobRef, created_at: DateTime<Utc>) -> Result<()> {

@@ -1,7 +1,5 @@
 #![cfg_attr(windows, allow(unsafe_code))]
 
-use std::process::Command;
-
 #[cfg(unix)]
 use nix::{
     sys::signal::{Signal, kill, killpg},
@@ -82,15 +80,6 @@ fn terminate_tree(_tree: &ProcessTree) -> Result<()> {
 }
 
 #[cfg(unix)]
-pub fn configure_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-pub fn configure_process_group(_command: &mut Command) {}
-
-#[cfg(unix)]
 pub fn configure_tokio_process_group(command: &mut tokio::process::Command) {
     use std::os::unix::process::CommandExt;
     command.as_std_mut().process_group(0);
@@ -98,18 +87,6 @@ pub fn configure_tokio_process_group(command: &mut tokio::process::Command) {
 
 #[cfg(not(unix))]
 pub fn configure_tokio_process_group(_command: &mut tokio::process::Command) {}
-
-#[cfg(unix)]
-pub fn interrupt_process_group(group: ProcessGroupId) -> Result<()> {
-    signal_group(group, Signal::SIGINT)
-}
-
-#[cfg(not(unix))]
-pub fn interrupt_process_group(_group: ProcessGroupId) -> Result<()> {
-    Err(WorkspaceError::ProcessTree(
-        "signal-style process-group interruption is unsupported on this platform".to_owned(),
-    ))
-}
 
 #[cfg(unix)]
 pub fn terminate_process_group(group: ProcessGroupId) -> Result<()> {

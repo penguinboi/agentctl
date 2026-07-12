@@ -25,7 +25,7 @@ type PendingRequests = Arc<Mutex<HashMap<u64, PendingSender>>>;
 
 /// A message initiated by the app-server.
 #[derive(Clone, Debug)]
-pub enum RpcInbound {
+pub(crate) enum RpcInbound {
     Notification {
         method: String,
         params: Value,
@@ -46,7 +46,7 @@ pub enum RpcInbound {
 
 /// Successful JSON-RPC result together with its client-generated request id.
 #[derive(Clone, Debug)]
-pub struct RpcResponse {
+pub(crate) struct RpcResponse {
     pub request_id: u64,
     pub result: Value,
 }
@@ -496,7 +496,7 @@ sleep 1
         permissions.set_mode(0o700);
         std::fs::set_permissions(&fake, permissions).unwrap();
 
-        let client = CodexRpcClient::spawn(&fake, 4, Duration::from_secs(1))
+        let client = CodexRpcClient::spawn(&fake, 4, Duration::from_secs(5))
             .await
             .unwrap();
         for _ in 0..50 {

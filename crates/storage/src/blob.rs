@@ -37,14 +37,11 @@ impl BlobStore {
         })
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn with_max_decompressed_size(mut self, bytes: u64) -> Self {
+    fn with_max_decompressed_size(mut self, bytes: u64) -> Self {
         self.max_decompressed_size = bytes;
         self
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     pub fn put(

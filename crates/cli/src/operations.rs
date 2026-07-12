@@ -37,18 +37,18 @@ const MAX_IMPORT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 const PLUGIN_MANIFEST_FILE: &str = "plugin.toml";
 
-pub fn open_store(paths: &AgentctlPaths) -> Result<AgentctlStore> {
+pub(crate) fn open_store(paths: &AgentctlPaths) -> Result<AgentctlStore> {
     AgentctlStore::open(&paths.database, &paths.blobs).context("failed to open local state")
 }
 
 #[derive(Clone, Debug)]
-pub struct NativeLaunchWorkspaceSnapshots {
+pub(crate) struct NativeLaunchWorkspaceSnapshots {
     pub before: GitSnapshot,
     pub after: Option<GitSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct NativeFailoverContinuation {
+pub(crate) struct NativeFailoverContinuation {
     pub event_id: EventId,
     pub seq: u64,
     pub turn_id: Option<TurnId>,
@@ -61,7 +61,7 @@ pub struct NativeFailoverContinuation {
 /// explicit in the monotonic side-effect state and in an idempotent audit
 /// event. The audit event is appended first so a crash between the two writes
 /// leaves the turn recoverable on the next boot rather than silently closed.
-pub fn terminalize_native_crash_turns(
+pub(crate) fn terminalize_native_crash_turns(
     store: &SqliteStore,
     guard: &PayloadGuard,
     session: &UnifiedSession,
@@ -134,7 +134,7 @@ pub fn terminalize_native_crash_turns(
 /// The pre-launch snapshot is mandatory. The post-launch snapshot can be
 /// written by the normal wrapper exit path or by crash reconciliation after
 /// the journaled process group is proven dead.
-pub fn native_launch_workspace_snapshots(
+pub(crate) fn native_launch_workspace_snapshots(
     store: &SqliteStore,
     session: &UnifiedSession,
     launch: &NativeLaunchRecord,
@@ -180,7 +180,7 @@ pub fn native_launch_workspace_snapshots(
 /// The marker is appended before the launch journal is closed, so a crash in
 /// between remains fail-closed and a retry observes the same event id.
 #[allow(clippy::too_many_lines)]
-pub fn persist_native_failover_continuation(
+pub(crate) fn persist_native_failover_continuation(
     store: &SqliteStore,
     guard: &PayloadGuard,
     session: &UnifiedSession,
@@ -342,7 +342,7 @@ fn deterministic_native_crash_turn_event_id(
 /// lease is acquired, closing the check/start time-of-check window.
 #[derive(Debug)]
 #[must_use]
-pub struct WorkspaceMutationGuard {
+pub(crate) struct WorkspaceMutationGuard {
     _leases: Vec<WorkspaceLease>,
     session_ids: Vec<UnifiedSessionId>,
 }
@@ -353,7 +353,7 @@ impl WorkspaceMutationGuard {
     }
 }
 
-pub fn guard_session_mutation(
+pub(crate) fn guard_session_mutation(
     paths: &AgentctlPaths,
     store: &SqliteStore,
     session: &UnifiedSession,
@@ -379,7 +379,7 @@ pub fn guard_session_mutation(
 /// Checks both the stable worktree identity and canonical session. The second
 /// query catches older journal entries whose recorded lease key no longer
 /// matches after a workspace repair.
-pub fn ensure_session_mutation_idle(
+pub(crate) fn ensure_session_mutation_idle(
     store: &SqliteStore,
     session: &UnifiedSession,
     identity: &WorkspaceIdentity,
@@ -466,7 +466,7 @@ fn guard_all_session_mutations(
 }
 
 /// Resolves an explicit UUID/name/path, or the most recently updated session for cwd.
-pub fn resolve_session(
+pub(crate) fn resolve_session(
     store: &SqliteStore,
     selector: Option<&str>,
     cwd: &Path,
@@ -541,13 +541,13 @@ fn normalize_existing_path(path: &Path) -> PathBuf {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct SessionListEntry {
+pub(crate) struct SessionListEntry {
     pub session: UnifiedSession,
     pub latest_seq: u64,
     pub provider_count: usize,
 }
 
-pub fn list_sessions(store: &SqliteStore) -> Result<Vec<SessionListEntry>> {
+pub(crate) fn list_sessions(store: &SqliteStore) -> Result<Vec<SessionListEntry>> {
     store
         .list_sessions()?
         .into_iter()
@@ -564,14 +564,14 @@ pub fn list_sessions(store: &SqliteStore) -> Result<Vec<SessionListEntry>> {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ProviderStatusView {
+pub(crate) struct ProviderStatusView {
     pub session: ProviderSessionRecord,
     pub sync_lag: u64,
     pub health: Option<ProviderHealth>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct WorkspaceStatusView {
+pub(crate) struct WorkspaceStatusView {
     pub exists: bool,
     pub identity: Option<WorkspaceIdentity>,
     pub fingerprint_changed: Option<bool>,
@@ -580,14 +580,17 @@ pub struct WorkspaceStatusView {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct SessionStatusView {
+pub(crate) struct SessionStatusView {
     pub session: UnifiedSession,
     pub latest_seq: u64,
     pub providers: Vec<ProviderStatusView>,
     pub workspace: WorkspaceStatusView,
 }
 
-pub fn session_status(store: &SqliteStore, session: UnifiedSession) -> Result<SessionStatusView> {
+pub(crate) fn session_status(
+    store: &SqliteStore,
+    session: UnifiedSession,
+) -> Result<SessionStatusView> {
     let latest_seq = latest_seq(store, session.id)?;
     let providers = store
         .list_provider_sessions(session.id)?
@@ -611,7 +614,7 @@ pub fn session_status(store: &SqliteStore, session: UnifiedSession) -> Result<Se
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
-pub struct UsageAggregate {
+pub(crate) struct UsageAggregate {
     pub snapshots: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -636,7 +639,7 @@ impl UsageAggregate {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct CanonicalMetrics {
+pub(crate) struct CanonicalMetrics {
     pub event_count: u64,
     pub turn_count: usize,
     pub raw_event_links: u64,
@@ -645,7 +648,7 @@ pub struct CanonicalMetrics {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ProviderMetrics {
+pub(crate) struct ProviderMetrics {
     pub provider: ProviderKind,
     pub native_session: Option<ProviderSessionRecord>,
     pub event_count: u64,
@@ -657,7 +660,7 @@ pub struct ProviderMetrics {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct SyncMetrics {
+pub(crate) struct SyncMetrics {
     pub latest_seq: u64,
     pub providers_behind: usize,
     pub total_lag: u64,
@@ -665,7 +668,7 @@ pub struct SyncMetrics {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct SessionMetrics {
+pub(crate) struct SessionMetrics {
     pub session: UnifiedSession,
     pub canonical: CanonicalMetrics,
     pub providers: Vec<ProviderMetrics>,
@@ -674,7 +677,10 @@ pub struct SessionMetrics {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn session_metrics(store: &SqliteStore, session: UnifiedSession) -> Result<SessionMetrics> {
+pub(crate) fn session_metrics(
+    store: &SqliteStore,
+    session: UnifiedSession,
+) -> Result<SessionMetrics> {
     let events = store.list_events(session.id, 0, usize::MAX)?;
     let latest_seq = events.last().map_or(0, |event| event.seq);
     let provider_sessions = store.list_provider_sessions(session.id)?;
@@ -788,7 +794,7 @@ pub fn session_metrics(store: &SqliteStore, session: UnifiedSession) -> Result<S
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct NativeAttachmentReport {
+pub(crate) struct NativeAttachmentReport {
     pub session_id: UnifiedSessionId,
     pub provider: ProviderKind,
     pub native_session_id: String,
@@ -801,7 +807,7 @@ pub struct NativeAttachmentReport {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct NativeImportReport {
+pub(crate) struct NativeImportReport {
     pub session_id: UnifiedSessionId,
     pub provider: ProviderKind,
     pub native_session_id: String,
@@ -833,7 +839,7 @@ struct NativeCaptureExpectation {
 /// This prevents advancing the projection cursor over unrelated events that
 /// the native session has never seen.
 #[allow(clippy::too_many_lines)]
-pub fn persist_native_capture(
+pub(crate) fn persist_native_capture(
     store: &SqliteStore,
     guard: &PayloadGuard,
     session: &UnifiedSession,
@@ -1332,7 +1338,7 @@ pub fn persist_native_capture(
 /// history API. The operation is idempotent at native turn/item granularity so
 /// an interrupted import can be safely resumed.
 #[allow(clippy::too_many_lines)]
-pub fn persist_native_import(
+pub(crate) fn persist_native_import(
     store: &SqliteStore,
     guard: &PayloadGuard,
     session: &UnifiedSession,
@@ -2509,7 +2515,7 @@ fn deterministic_import_turn_id(
     TurnId(Uuid::from_bytes(bytes))
 }
 
-pub fn persist_native_attachment(
+pub(crate) fn persist_native_attachment(
     store: &SqliteStore,
     session: &UnifiedSession,
     native: &NativeSession,
@@ -2680,13 +2686,13 @@ fn inspect_workspace(path: &Path, recorded_fingerprint: &str) -> WorkspaceStatus
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct HistoryEntry {
+pub(crate) struct HistoryEntry {
     pub event: CanonicalEvent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<RawProviderEvent>,
 }
 
-pub fn session_history(
+pub(crate) fn session_history(
     store: &SqliteStore,
     session_id: UnifiedSessionId,
     include_raw: bool,
@@ -2722,14 +2728,14 @@ fn latest_seq(store: &SqliteStore, session_id: UnifiedSessionId) -> Result<u64> 
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ExportOptions {
+pub(crate) struct ExportOptions {
     pub include_blobs: bool,
     pub redact: bool,
     pub include_internal: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ExportReport {
+pub(crate) struct ExportReport {
     pub output: PathBuf,
     pub blob_directory: Option<PathBuf>,
     pub event_count: usize,
@@ -2738,7 +2744,7 @@ pub struct ExportReport {
     pub redacted: bool,
 }
 
-pub fn export_session(
+pub(crate) fn export_session(
     store: &AgentctlStore,
     session: UnifiedSession,
     output: &Path,
@@ -2866,13 +2872,13 @@ fn collect_blob_refs(events: &[CanonicalEvent]) -> BTreeMap<String, BlobRef> {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ImportReport {
+pub(crate) struct ImportReport {
     pub session: UnifiedSession,
     pub event_count: usize,
     pub imported_blobs: usize,
 }
 
-pub fn import_session(store: &AgentctlStore, input: &Path) -> Result<ImportReport> {
+pub(crate) fn import_session(store: &AgentctlStore, input: &Path) -> Result<ImportReport> {
     refuse_non_regular_file(input)?;
     let metadata = fs::metadata(input)?;
     ensure!(
@@ -2958,12 +2964,15 @@ fn import_bundle_blobs(
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct DeleteReport {
+pub(crate) struct DeleteReport {
     pub id: UnifiedSessionId,
     pub name: String,
 }
 
-pub fn delete_session(store: &SqliteStore, session: &UnifiedSession) -> Result<DeleteReport> {
+pub(crate) fn delete_session(
+    store: &SqliteStore,
+    session: &UnifiedSession,
+) -> Result<DeleteReport> {
     store.delete_session(session.id)?;
     Ok(DeleteReport {
         id: session.id,
@@ -2972,7 +2981,7 @@ pub fn delete_session(store: &SqliteStore, session: &UnifiedSession) -> Result<D
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct RetentionReport {
+pub(crate) struct RetentionReport {
     pub cutoff: DateTime<Utc>,
     pub deleted_sessions: Vec<UnifiedSessionId>,
     pub deleted_blobs: Vec<String>,
@@ -2983,7 +2992,7 @@ pub struct RetentionReport {
 /// Deletes canonical sessions that have not been updated within the configured
 /// retention window. A stale parent is retained while any non-expired child
 /// still references it; expired descendants are deleted before their parents.
-pub fn enforce_retention(
+pub(crate) fn enforce_retention(
     store: &AgentctlStore,
     retention_days: u64,
     now: DateTime<Utc>,
@@ -3050,7 +3059,7 @@ pub fn enforce_retention(
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct CompactionReport {
+pub(crate) struct CompactionReport {
     pub checkpoint: ContextCheckpoint,
     pub projection_version: u32,
     pub retained_events: usize,
@@ -3059,7 +3068,7 @@ pub struct CompactionReport {
     pub inserted: bool,
 }
 
-pub fn compact_session(
+pub(crate) fn compact_session(
     store: &SqliteStore,
     session_id: UnifiedSessionId,
     policy: CompactionPolicy,
@@ -3125,13 +3134,13 @@ pub fn compact_session(
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ForkReport {
+pub(crate) struct ForkReport {
     pub session: UnifiedSession,
     pub through_seq: u64,
     pub copied_events: usize,
 }
 
-pub fn fork_session(
+pub(crate) fn fork_session(
     store: &SqliteStore,
     parent: &UnifiedSession,
     name: Option<&str>,
@@ -3170,7 +3179,7 @@ pub fn fork_session(
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct RepairReport {
+pub(crate) struct RepairReport {
     pub integrity_before: String,
     pub integrity_after: String,
     pub indexes_rebuilt: bool,
@@ -3186,14 +3195,14 @@ pub struct RepairReport {
 }
 
 impl RepairReport {
-    pub fn healthy(&self) -> bool {
+    pub(crate) fn healthy(&self) -> bool {
         self.integrity_after == "ok"
             && self.corrupt_blobs.is_empty()
             && self.unresolved_native_launches.is_empty()
     }
 }
 
-pub fn repair_local_state(
+pub(crate) fn repair_local_state(
     paths: &AgentctlPaths,
     store: &AgentctlStore,
     rebuild_projections: bool,
@@ -3414,18 +3423,18 @@ fn verify_compressed_blob(path: &Path) -> Result<()> {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct InstalledPlugin {
+pub(crate) struct InstalledPlugin {
     pub manifest: PluginManifest,
     pub manifest_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct PluginInstallReport {
+pub(crate) struct PluginInstallReport {
     pub plugin: InstalledPlugin,
     pub updated: bool,
 }
 
-pub fn install_plugin(
+pub(crate) fn install_plugin(
     paths: &AgentctlPaths,
     source_manifest: &Path,
 ) -> Result<PluginInstallReport> {
@@ -3466,7 +3475,7 @@ pub fn install_plugin(
     })
 }
 
-pub fn list_plugins(paths: &AgentctlPaths) -> Result<Vec<InstalledPlugin>> {
+pub(crate) fn list_plugins(paths: &AgentctlPaths) -> Result<Vec<InstalledPlugin>> {
     let mut plugins = Vec::new();
     for name in installed_plugin_names(paths)? {
         plugins.push(load_installed_plugin(paths, &name)?);
@@ -3476,12 +3485,12 @@ pub fn list_plugins(paths: &AgentctlPaths) -> Result<Vec<InstalledPlugin>> {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct PluginRemoveReport {
+pub(crate) struct PluginRemoveReport {
     pub name: String,
     pub removed: bool,
 }
 
-pub fn remove_plugin(paths: &AgentctlPaths, name: &str) -> Result<PluginRemoveReport> {
+pub(crate) fn remove_plugin(paths: &AgentctlPaths, name: &str) -> Result<PluginRemoveReport> {
     validate_plugin_name(name)?;
     let directory = paths.plugins.join(name);
     if !directory.exists() {
@@ -3500,14 +3509,14 @@ pub fn remove_plugin(paths: &AgentctlPaths, name: &str) -> Result<PluginRemoveRe
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PluginDoctorState {
+pub(crate) enum PluginDoctorState {
     Compatible,
     Incompatible,
     Invalid,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct PluginDoctorEntry {
+pub(crate) struct PluginDoctorEntry {
     pub name: String,
     pub state: PluginDoctorState,
     pub manifest_path: PathBuf,
@@ -3516,7 +3525,7 @@ pub struct PluginDoctorEntry {
     pub detail: String,
 }
 
-pub fn doctor_plugins(
+pub(crate) fn doctor_plugins(
     paths: &AgentctlPaths,
     selected_name: Option<&str>,
 ) -> Result<Vec<PluginDoctorEntry>> {

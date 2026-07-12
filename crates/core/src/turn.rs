@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{ProviderKind, TurnId, UnifiedSessionId};
+use crate::{TurnId, UnifiedSessionId};
 
 /// Provider-neutral execution contract for a turn. Read-only review is
 /// capability-gated and must fail closed when an adapter cannot enforce it.
@@ -66,13 +66,4 @@ impl PartialOrd for SideEffectState {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
-pub struct RoutingDecision {
-    pub provider: ProviderKind,
-    pub policy: String,
-    pub score: f64,
-    pub reason: String,
-    pub replayed: bool,
 }

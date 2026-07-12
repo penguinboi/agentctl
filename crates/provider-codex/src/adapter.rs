@@ -245,7 +245,7 @@ impl CodexAdapter {
     }
 
     /// Returns an existing schema directory or generates one for the installed version.
-    pub async fn prepare_schema(&self) -> Result<PathBuf, ProviderError> {
+    async fn prepare_schema(&self) -> Result<PathBuf, ProviderError> {
         let installation = self.installation().await?;
         if let Some(root) = &self.config.schema_cache_root {
             return generate_schema_cache_under(&installation, root).await;

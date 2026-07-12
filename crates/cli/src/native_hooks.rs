@@ -74,7 +74,7 @@ impl ClaudeHandoffStage {
 
 /// Files and native session identity required to open the provider-owned CLI.
 #[derive(Clone, Debug, Serialize)]
-pub struct PreparedClaudeNative {
+pub(crate) struct PreparedClaudeNative {
     pub launch_id: Uuid,
     pub native_session_id: String,
     pub resume: bool,
@@ -84,7 +84,7 @@ pub struct PreparedClaudeNative {
 
 /// Prepares a native Claude Code launch without spawning it.
 #[allow(clippy::too_many_lines)]
-pub fn prepare_native_claude(
+pub(crate) fn prepare_native_claude(
     store: &AgentctlStore,
     paths: &AgentctlPaths,
     config: &Config,
@@ -235,7 +235,7 @@ pub fn prepare_native_claude(
 
 /// Opens Claude Code's native interactive CLI with lifecycle capture enabled.
 #[allow(clippy::too_many_lines)]
-pub async fn run_native_claude(
+pub(crate) async fn run_native_claude(
     store: &AgentctlStore,
     paths: &AgentctlPaths,
     config: &Config,
@@ -461,7 +461,7 @@ fn record_native_child_exit(
 }
 
 /// Internal command invoked by Claude Code's documented command hooks.
-pub async fn handle_claude_hook(
+pub(crate) async fn handle_claude_hook(
     _paths: &AgentctlPaths,
     config: &Config,
     store: &AgentctlStore,
@@ -2703,7 +2703,7 @@ mod tests {
             let mut payload = json!({
                 "session_id": self.native_session_id,
                 "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
-                "transcript_path": "/untrusted/transcript.jsonl",
+                "transcript_path": self.root.path().join("untrusted-transcript.jsonl"),
                 "cwd": self.workspace.path(),
                 "permission_mode": "default",
                 "hook_event_name": event,

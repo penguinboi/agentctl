@@ -3,16 +3,13 @@ resolver = "2"
 members = [
   "crates/cli",
   "crates/core",
-  "crates/routing",
   "crates/transcript",
   "crates/provider-codex",
   "crates/provider-claude",
-  "crates/approvals",
   "crates/workspace",
   "crates/storage",
   "crates/telemetry",
   "crates/plugin-protocol",
-  "crates/testkit",
 ]
 
 [workspace.package]
@@ -26,16 +23,13 @@ publish = false
 
 [workspace.dependencies]
 agentctl-core = { path = "crates/core", version = "0.1.0" }
-agentctl-routing = { path = "crates/routing", version = "0.1.0" }
 agentctl-transcript = { path = "crates/transcript", version = "0.1.0" }
 agentctl-provider-codex = { path = "crates/provider-codex", version = "0.1.0" }
 agentctl-provider-claude = { path = "crates/provider-claude", version = "0.1.0" }
-agentctl-approvals = { path = "crates/approvals", version = "0.1.0" }
 agentctl-workspace = { path = "crates/workspace", version = "0.1.0" }
 agentctl-storage = { path = "crates/storage", version = "0.1.0" }
 agentctl-telemetry = { path = "crates/telemetry", version = "0.1.0" }
 agentctl-plugin-protocol = { path = "crates/plugin-protocol", version = "0.1.0" }
-agentctl-testkit = { path = "crates/testkit", version = "0.1.0" }
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -46,18 +40,17 @@ fs2 = "0.4"
 futures = "0.3"
 hex = "0.4"
 nix = { version = "0.30", features = ["process", "signal", "term"] }
-proptest = "1.7"
 regex = "1.11"
-rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 schemars = { version = "1.0", features = ["chrono04", "uuid1"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tempfile = "3.20"
 thiserror = "2.0"
-tokio = { version = "1.47", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["io-util", "sync"] }
-tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tokio = { version = "1.47", features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
@@ -68,6 +61,7 @@ zstd = "0.13"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
+unreachable_pub = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

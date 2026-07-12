@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "agentctl", version, about, long_about = None)]
-pub struct Cli {
+pub(crate) struct Cli {
     /// Override the agentctl state directory.
     #[arg(long, global = true, env = "AGENTCTL_HOME")]
     pub home: Option<PathBuf>,
@@ -18,7 +18,7 @@ pub struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Command {
+pub(crate) enum Command {
     /// Open a canonical session in the provider's native interactive CLI.
     Open(OpenArgs),
     /// Synchronize the canonical delta and switch to another native interactive CLI.
@@ -67,7 +67,7 @@ pub enum Command {
 }
 
 #[derive(Debug, Args)]
-pub struct OpenArgs {
+pub(crate) struct OpenArgs {
     /// Native provider to open. Defaults to the session's active provider.
     #[arg(value_enum)]
     pub provider: Option<NativeProviderChoice>,
@@ -80,7 +80,7 @@ pub struct OpenArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct SwitchArgs {
+pub(crate) struct SwitchArgs {
     #[arg(value_enum)]
     pub provider: NativeProviderChoice,
     /// Canonical session UUID or unique name. Defaults to the current workspace session.
@@ -92,7 +92,7 @@ pub struct SwitchArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct NewArgs {
+pub(crate) struct NewArgs {
     #[arg(long)]
     pub name: Option<String>,
     #[arg(long, default_value = ".")]
@@ -109,7 +109,7 @@ pub struct NewArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ResumeArgs {
+pub(crate) struct ResumeArgs {
     pub session: String,
     /// Override the session's active provider for this launch.
     #[arg(long, value_enum)]
@@ -120,7 +120,7 @@ pub struct ResumeArgs {
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
-pub enum ProviderChoice {
+pub(crate) enum ProviderChoice {
     #[default]
     Auto,
     Claude,
@@ -128,23 +128,23 @@ pub enum ProviderChoice {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum NativeProviderChoice {
+pub(crate) enum NativeProviderChoice {
     Claude,
     Codex,
 }
 
 #[derive(Debug, Args)]
-pub struct SessionArg {
+pub(crate) struct SessionArg {
     pub session: String,
 }
 
 #[derive(Debug, Args)]
-pub struct OptionalSessionArg {
+pub(crate) struct OptionalSessionArg {
     pub session: Option<String>,
 }
 
 #[derive(Debug, Args)]
-pub struct DoctorArgs {
+pub(crate) struct DoctorArgs {
     /// Execute disposable real turns; this may consume provider quota.
     #[arg(long)]
     pub live: bool,
@@ -154,7 +154,7 @@ pub struct DoctorArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct HistoryArgs {
+pub(crate) struct HistoryArgs {
     pub session: Option<String>,
     #[arg(long)]
     pub raw: bool,
@@ -163,7 +163,7 @@ pub struct HistoryArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ExportArgs {
+pub(crate) struct ExportArgs {
     pub session: String,
     pub output: PathBuf,
     #[arg(long)]
@@ -176,12 +176,12 @@ pub struct ExportArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ImportArgs {
+pub(crate) struct ImportArgs {
     pub input: PathBuf,
 }
 
 #[derive(Debug, Args)]
-pub struct AttachArgs {
+pub(crate) struct AttachArgs {
     #[arg(value_enum)]
     pub provider: NativeProviderChoice,
     /// Existing Codex thread id or Claude session UUID.
@@ -195,7 +195,7 @@ pub struct AttachArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ImportNativeArgs {
+pub(crate) struct ImportNativeArgs {
     /// Provider whose official history API will be used. Only Codex currently exposes one.
     #[arg(value_enum)]
     pub provider: ImportNativeProviderChoice,
@@ -210,12 +210,12 @@ pub struct ImportNativeArgs {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum ImportNativeProviderChoice {
+pub(crate) enum ImportNativeProviderChoice {
     Codex,
 }
 
 #[derive(Debug, Args)]
-pub struct RepairArgs {
+pub(crate) struct RepairArgs {
     #[arg(long)]
     pub rebuild_projections: bool,
     /// Abandon an exited/uncertain launch after verifying its provider process
@@ -225,7 +225,7 @@ pub struct RepairArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ForkArgs {
+pub(crate) struct ForkArgs {
     pub session: String,
     #[arg(long)]
     pub name: Option<String>,
@@ -234,7 +234,7 @@ pub struct ForkArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ProviderArgs {
+pub(crate) struct ProviderArgs {
     #[arg(value_enum)]
     pub provider: ProviderChoice,
     #[arg(long)]
@@ -242,37 +242,37 @@ pub struct ProviderArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct WorkspaceArgs {
+pub(crate) struct WorkspaceArgs {
     #[command(subcommand)]
     pub command: WorkspaceCommand,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum WorkspaceCommand {
+pub(crate) enum WorkspaceCommand {
     List,
     Use { path: PathBuf },
 }
 
 #[derive(Debug, Args)]
-pub struct PluginArgs {
+pub(crate) struct PluginArgs {
     #[command(subcommand)]
     pub command: PluginCommand,
 }
 
 #[derive(Debug, Args)]
-pub struct HookArgs {
+pub(crate) struct HookArgs {
     #[command(subcommand)]
     pub command: HookCommand,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum HookCommand {
+pub(crate) enum HookCommand {
     /// Capture one Claude Code native hook event.
     Claude(ClaudeHookArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct ClaudeHookArgs {
+pub(crate) struct ClaudeHookArgs {
     /// Canonical agentctl session UUID.
     #[arg(long)]
     pub session: String,
@@ -288,7 +288,7 @@ pub struct ClaudeHookArgs {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum PluginCommand {
+pub(crate) enum PluginCommand {
     List,
     Install { manifest: PathBuf },
     Remove { name: String },

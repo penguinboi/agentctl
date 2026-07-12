@@ -4,18 +4,14 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
-pub struct ClaudeInit {
+pub(crate) struct ClaudeInit {
     pub session_id: String,
     pub version: Option<String>,
-    pub model: Option<String>,
-    pub tools: Vec<String>,
-    pub mcp_servers: Vec<String>,
-    pub plugins: Vec<String>,
     pub capabilities: BTreeMap<String, bool>,
 }
 
 impl ClaudeInit {
-    pub fn from_frame(frame: &Value) -> Option<Self> {
+    pub(crate) fn from_frame(frame: &Value) -> Option<Self> {
         if frame.get("type")?.as_str()? != "system" || frame.get("subtype")?.as_str()? != "init" {
             return None;
         }
@@ -35,27 +31,6 @@ impl ClaudeInit {
                 .get("claude_code_version")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
-            model: frame
-                .get("model")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            tools: strings(frame.get("tools")),
-            mcp_servers: frame
-                .get("mcp_servers")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|server| server.get("name").and_then(Value::as_str))
-                .map(ToOwned::to_owned)
-                .collect(),
-            plugins: frame
-                .get("plugins")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|plugin| plugin.get("name").and_then(Value::as_str))
-                .map(ToOwned::to_owned)
-                .collect(),
             capabilities,
         })
     }
@@ -104,16 +79,6 @@ pub(crate) fn control_success(request_id: &str, response: &Value) -> Value {
             "response": response
         }
     })
-}
-
-fn strings(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 #[cfg(test)]

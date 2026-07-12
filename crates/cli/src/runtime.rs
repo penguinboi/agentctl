@@ -23,7 +23,7 @@ use agentctl_workspace::WorkspaceIdentity;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -33,20 +33,20 @@ pub(crate) const PROVIDER_SHUTDOWN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
 
 #[derive(Clone)]
-pub struct Runtime {
+pub(crate) struct Runtime {
     inner: Arc<RuntimeInner>,
 }
 
 struct RuntimeInner {
     store: AgentctlStore,
-    session: RwLock<UnifiedSession>,
+    session: UnifiedSession,
     providers: BTreeMap<ProviderKind, Arc<dyn AgentProvider>>,
     payload_guard: PayloadGuard,
     operation_guard: Mutex<()>,
 }
 
 impl Runtime {
-    pub fn new(
+    pub(crate) fn new(
         store: AgentctlStore,
         config: &Config,
         session: UnifiedSession,
@@ -61,7 +61,7 @@ impl Runtime {
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 store,
-                session: RwLock::new(session),
+                session,
                 providers,
                 payload_guard: config.payload_guard()?,
                 operation_guard: Mutex::new(()),
@@ -69,13 +69,13 @@ impl Runtime {
         })
     }
 
-    async fn session(&self) -> UnifiedSession {
-        self.inner.session.read().await.clone()
+    fn session(&self) -> UnifiedSession {
+        self.inner.session.clone()
     }
 
     /// Tears down every helper process. Every provider is attempted even when
     /// another provider's shutdown fails.
-    pub async fn shutdown(&self) -> Result<()> {
+    pub(crate) async fn shutdown(&self) -> Result<()> {
         let shutdowns = self.inner.providers.values().map(|provider| async move {
             (
                 provider.kind(),
@@ -100,13 +100,8 @@ impl Runtime {
     /// Closes turns left by the removed headless engine. This is migration
     /// hygiene only; native turns are recovered through the native launch
     /// journal instead.
-    pub fn recover_crashed_turns(&self) -> Result<Vec<TurnId>> {
-        let session = self
-            .inner
-            .session
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("session is busy during recovery"))?
-            .clone();
+    pub(crate) fn recover_crashed_turns(&self) -> Result<Vec<TurnId>> {
+        let session = self.session();
         let events = self.all_events(session.id)?;
         let mut recovered = Vec::new();
         for turn in self
@@ -185,9 +180,9 @@ impl Runtime {
 
     /// Projects the canonical delta to every configured provider without
     /// starting a model turn.
-    pub async fn sync_all(&self) -> Result<serde_json::Value> {
+    pub(crate) async fn sync_all(&self) -> Result<serde_json::Value> {
         let _guard = self.inner.operation_guard.lock().await;
-        let session = self.session().await;
+        let session = self.session();
         let identity = WorkspaceIdentity::discover(&session.workspace_path)?;
         let latest = self.inner.store.next_seq(session.id)?.saturating_sub(1);
         let context = SessionContext {
@@ -245,7 +240,7 @@ impl Runtime {
 
     /// Restores one provider projection and applies the canonical delta. It
     /// never starts a model turn.
-    pub async fn prepare_native_projection(
+    pub(crate) async fn prepare_native_projection(
         &self,
         provider_kind: &ProviderKind,
     ) -> Result<NativeSession> {
@@ -265,7 +260,7 @@ impl Runtime {
             .await
             .map_err(|_| anyhow::anyhow!("provider {provider_kind} health probe timed out"))??;
         let health = self.effective_health(&probed)?;
-        let session = self.session().await;
+        let session = self.session();
         self.inner.store.record_health(Some(session.id), &health)?;
         if !health.status.available() {
             bail!(
@@ -569,23 +564,113 @@ fn sync_receipt_is_durable(native_receipt: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use agentctl_core::{
-        AgentProvider, AuthMode, CanonicalEvent, EventId, EventVisibility, ProviderKind,
-        ProviderSessionId, ProviderStatus, SessionStatus, SideEffectState, TurnId, TurnStatus,
-        UnifiedSession, UnifiedSessionId,
+        AgentProvider, AuthMode, CanonicalEvent, EventId, EventVisibility, NativeSession,
+        ProviderError, ProviderEventStream, ProviderHealth, ProviderKind, ProviderSessionId,
+        ProviderStatus, SessionContext, SessionStatus, SideEffectState, SyncBatch, SyncReceipt,
+        TurnId, TurnRequest, TurnStatus, UnifiedSession, UnifiedSessionId,
     };
     use agentctl_storage::{
         NativeHandoffState, NativeLaunchState, ProviderSessionRecord, TurnRecord,
         canonical_content_hash,
     };
-    use agentctl_testkit::FakeProvider;
     use agentctl_workspace::WorkspaceIdentity;
+    use async_trait::async_trait;
     use chrono::Utc;
 
     use super::{Runtime, sync_receipt_is_durable};
     use crate::{config::Config, operations, paths::AgentctlPaths};
+
+    #[derive(Clone, Debug, Default)]
+    struct DeferredClaudeProvider {
+        syncs: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    impl DeferredClaudeProvider {
+        fn sync_count(&self) -> usize {
+            self.syncs.load(Ordering::Relaxed)
+        }
+
+        fn shutdown_count(&self) -> usize {
+            self.shutdowns.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for DeferredClaudeProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Claude
+        }
+
+        async fn probe(&self) -> Result<ProviderHealth, ProviderError> {
+            Ok(ProviderHealth {
+                provider: ProviderKind::Claude,
+                status: ProviderStatus::Ready,
+                version: Some("test".to_owned()),
+                capabilities: BTreeMap::new(),
+                usage: None,
+                rate_limit: None,
+                checked_at: Utc::now(),
+                message: None,
+            })
+        }
+
+        async fn ensure_session(
+            &self,
+            context: &SessionContext,
+        ) -> Result<NativeSession, ProviderError> {
+            Ok(NativeSession {
+                id: ProviderSessionId::new(),
+                provider: ProviderKind::Claude,
+                native_session_id: format!("test-{}", context.unified_session_id),
+                native_version: Some("test".to_owned()),
+                capabilities: BTreeMap::new(),
+            })
+        }
+
+        async fn sync_context(
+            &self,
+            _session: &NativeSession,
+            batch: SyncBatch,
+        ) -> Result<SyncReceipt, ProviderError> {
+            self.syncs.fetch_add(1, Ordering::Relaxed);
+            Ok(SyncReceipt {
+                through_seq: batch.through_seq_inclusive,
+                projection_version: batch.projection_version,
+                native_receipt: Some("claude:should-query-false".to_owned()),
+            })
+        }
+
+        async fn run_turn(
+            &self,
+            _session: &NativeSession,
+            _request: TurnRequest,
+        ) -> Result<ProviderEventStream, ProviderError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn interrupt(
+            &self,
+            _session: &NativeSession,
+            _native_turn_id: &str,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<(), ProviderError> {
+            self.shutdowns.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     #[test]
     fn only_deferred_claude_projection_receipts_are_not_durable() {
@@ -668,8 +753,7 @@ mod tests {
             })
             .unwrap();
 
-        let fake = FakeProvider::new(ProviderKind::Claude, Vec::new())
-            .with_sync_receipt("claude:should-query-false");
+        let fake = DeferredClaudeProvider::default();
         let mut providers: BTreeMap<ProviderKind, Arc<dyn AgentProvider>> = BTreeMap::new();
         providers.insert(ProviderKind::Claude, Arc::new(fake.clone()));
         for _ in 0..2 {
@@ -690,10 +774,10 @@ mod tests {
             runtime.shutdown().await.unwrap();
         }
         assert!(
-            fake.syncs().await.is_empty(),
+            fake.sync_count() == 0,
             "sync must not enqueue Claude context"
         );
-        assert_eq!(fake.shutdown_count().await, 2);
+        assert_eq!(fake.shutdown_count(), 2);
         let provider = store
             .provider_session(session.id, &ProviderKind::Claude)
             .unwrap()

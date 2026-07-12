@@ -17,12 +17,9 @@
         "max_recent_failures": { "type": "integer", "minimum": 0 },
         "affinity": {
           "type": "object",
-          "additionalProperties": {
-            "oneOf": [
-              { "enum": ["auto", "claude", "codex"] },
-              { "type": "string", "pattern": "^plugin:[a-z][a-z0-9_-]*$" }
-            ]
-          }
+          "deprecated": true,
+          "description": "Legacy compatibility setting. Accepted but ignored because native provider selection occurs before a prompt exists.",
+          "additionalProperties": { "type": "string" }
         }
       }
     },

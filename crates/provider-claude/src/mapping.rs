@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 /// Maps one complete Claude Code stream-json frame and always retains its raw envelope.
-pub fn map_message(frame: &Value) -> Vec<AgentEvent> {
+pub(crate) fn map_message(frame: &Value) -> Vec<AgentEvent> {
     let wire_kind = wire_kind(frame);
     let mut events = vec![AgentEvent::ProviderSpecific {
         provider: ProviderKind::Claude,
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn maps_redacted_fixture_without_a_model_call() {
-        let events = include_str!("../tests/fixtures/turn.jsonl")
+        let events = include_str!("../../../fixtures/claude/2.1/turn.jsonl")
             .lines()
             .flat_map(|line| {
                 let value: serde_json::Value = serde_json::from_str(line).unwrap();

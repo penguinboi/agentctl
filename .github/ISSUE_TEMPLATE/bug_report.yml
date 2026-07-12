@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a reproducible agentctl failure or unsafe handoff.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste credentials, private provider transcripts, or proprietary source code. Security vulnerabilities belong in a private advisory.
+  - type: input
+    id: agentctl-version
+    attributes:
+      label: agentctl version
+      placeholder: agentctl 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: provider-versions
+    attributes:
+      label: Native provider versions
+      description: Include `claude --version` and/or `codex --version`.
+      placeholder: Claude Code 2.x; codex-cli 0.x
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86_64
+        - macOS Apple Silicon
+        - macOS Intel
+        - Windows x86_64
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Give the smallest command sequence that reproduces the problem.
+      placeholder: |
+        1. agentctl new ...
+        2. Exit the native provider ...
+        3. agentctl switch ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and redacted diagnostics
+      description: Include only sanitized output. `agentctl doctor` is preferred over private transcript content.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials, private transcripts, and proprietary source from this report.
+          required: true
+        - label: I exited the native provider before switching, unless the bug is specifically about crash recovery.
+          required: true

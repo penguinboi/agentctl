@@ -10,8 +10,6 @@ pub use adapter::{
     CodexAdapter, CodexConfig, InteractiveThreadIdentity, InteractiveThreadSnapshot,
     MAX_INTERACTIVE_THREAD_SNAPSHOT,
 };
-pub use jsonrpc::{RpcInbound, RpcResponse};
-pub use mapping::{map_notification, parse_rate_limit};
 pub use schema::{
     CodexInstallation, detect_installation, generate_schema_cache, generate_schema_cache_under,
 };

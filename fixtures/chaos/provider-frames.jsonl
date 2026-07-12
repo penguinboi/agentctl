@@ -1,5 +1,0 @@
-{"seq":2,"kind":"delta","id":"frame-2","payload":"arrived-first"}
-{"seq":1,"kind":"delta","id":"frame-1","payload":"arrived-late"}
-this-is-not-json
-{"seq":1,"kind":"delta","id":"frame-1","payload":"arrived-late"}
-{"seq":3,"kind":"completed","id":"frame-3","payload":"after-malformed"}

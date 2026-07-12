@@ -4,10 +4,7 @@
 //! temporary `--settings` document for the native interactive CLI and parses
 //! the documented command-hook payloads emitted by that process.
 
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -20,8 +17,6 @@ const MAX_PATH_BYTES: usize = 32 * 1024;
 const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ARGS: usize = 128;
 const MAX_ARG_BYTES: usize = 32 * 1024;
-
-pub const DEFAULT_NATIVE_HOOK_TIMEOUT_SECONDS: u64 = 10;
 
 /// Hook events used to mirror the lifecycle of an interactive Claude session.
 pub const INTERACTIVE_HOOK_EVENTS: [&str; 8] = [
@@ -123,38 +118,6 @@ pub fn merge_interactive_hook_settings(
         }
     }
     Ok(settings)
-}
-
-/// Convenience builder for callers forwarding their current executable and
-/// argument vector to the native hook handler.
-pub fn build_native_hook_settings(
-    existing: Option<&Value>,
-    executable: &Path,
-    command_args: &[OsString],
-) -> Result<Value, NativeHookError> {
-    let args = command_args
-        .iter()
-        .map(|argument| {
-            argument.to_str().map(ToOwned::to_owned).ok_or_else(|| {
-                NativeHookError::InvalidSettings("hook arguments must be valid UTF-8".to_owned())
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let command = NativeHookCommand::new(executable, args, DEFAULT_NATIVE_HOOK_TIMEOUT_SECONDS)?;
-    merge_interactive_hook_settings(existing, &command)
-}
-
-/// Parses, merges, and pretty-prints a Claude settings document.
-pub fn merge_interactive_hook_settings_json(
-    existing: Option<&[u8]>,
-    command: &NativeHookCommand,
-) -> Result<Vec<u8>, NativeHookError> {
-    let parsed = match existing {
-        Some(bytes) if !bytes.is_empty() => Some(serde_json::from_slice(bytes)?),
-        _ => None,
-    };
-    let merged = merge_interactive_hook_settings(parsed.as_ref(), command)?;
-    Ok(serde_json::to_vec_pretty(&merged)?)
 }
 
 /// Fields common to all supported native Claude hook events.
@@ -323,10 +286,7 @@ impl NativeHookEvent {
     }
 
     /// Validates that an event belongs to the provider session agentctl launched.
-    pub fn validate_expected_session(
-        &self,
-        expected_session_id: &str,
-    ) -> Result<(), NativeHookError> {
+    fn validate_expected_session(&self, expected_session_id: &str) -> Result<(), NativeHookError> {
         validate_bounded_string(
             expected_session_id,
             "expected session_id",
@@ -385,11 +345,6 @@ pub fn parse_hook_payload_for_session(
     Ok(event)
 }
 
-/// Builds the structured stdout expected from a `SessionStart` command hook.
-pub fn session_start_additional_context(context: &str) -> Result<Value, NativeHookError> {
-    additional_context_for_event("SessionStart", context)
-}
-
 /// Builds the structured stdout expected from a `UserPromptSubmit` command
 /// hook. This is the safe handoff boundary: Claude adds the context to the
 /// prompt that is about to query the model, while an idle native launch does
@@ -416,18 +371,6 @@ fn additional_context_for_event(
             "additionalContext": context,
         }
     }))
-}
-
-/// Short alias used by native-hook command handlers when writing stdout.
-pub fn additional_context_output(context: &str) -> Result<Value, NativeHookError> {
-    session_start_additional_context(context)
-}
-
-/// Serializes structured `SessionStart` hook stdout as a single JSON document.
-pub fn session_start_additional_context_json(context: &str) -> Result<Vec<u8>, NativeHookError> {
-    Ok(serde_json::to_vec(&session_start_additional_context(
-        context,
-    )?)?)
 }
 
 #[derive(Debug, Error)]
@@ -794,9 +737,8 @@ mod tests {
     use super::{
         INTERACTIVE_HOOK_EVENTS, NativeHookCommand, NativeHookError, NativeHookEvent,
         PermissionMode, SessionEndReason, SessionStartSource, StopFailureKind,
-        merge_interactive_hook_settings, merge_interactive_hook_settings_json, parse_hook_payload,
-        parse_hook_payload_for_session, session_start_additional_context,
-        session_start_additional_context_json, user_prompt_submit_additional_context,
+        merge_interactive_hook_settings, parse_hook_payload, parse_hook_payload_for_session,
+        user_prompt_submit_additional_context,
     };
 
     fn common(event: &str) -> Value {
@@ -865,15 +807,10 @@ mod tests {
     }
 
     #[test]
-    fn settings_merge_is_idempotent_and_json_round_trips() {
+    fn settings_merge_is_idempotent() {
         let first = merge_interactive_hook_settings(None, &command()).unwrap();
         let second = merge_interactive_hook_settings(Some(&first), &command()).unwrap();
         assert_eq!(first, second);
-
-        let encoded =
-            merge_interactive_hook_settings_json(Some(br#"{"theme":"dark"}"#), &command()).unwrap();
-        let decoded: Value = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(decoded["theme"], "dark");
     }
 
     #[test]
@@ -1093,29 +1030,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_bounded_structured_session_start_output() {
-        let value = session_start_additional_context("handoff from Codex").unwrap();
-        assert_eq!(value["hookSpecificOutput"]["hookEventName"], "SessionStart");
-        assert_eq!(
-            value["hookSpecificOutput"]["additionalContext"],
-            "handoff from Codex"
-        );
-        let bytes = session_start_additional_context_json("context").unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&bytes).unwrap()["hookSpecificOutput"]["additionalContext"],
-            "context"
-        );
-        assert!(matches!(
-            session_start_additional_context(""),
-            Err(NativeHookError::InvalidOutput(_))
-        ));
-        assert!(matches!(
-            session_start_additional_context(&"x".repeat(10_001)),
-            Err(NativeHookError::InvalidOutput(_))
-        ));
-    }
-
-    #[test]
     fn builds_user_prompt_submit_additional_context_output() {
         let value = user_prompt_submit_additional_context("handoff from Codex").unwrap();
         assert_eq!(
@@ -1128,6 +1042,10 @@ mod tests {
         );
         assert!(matches!(
             user_prompt_submit_additional_context(""),
+            Err(NativeHookError::InvalidOutput(_))
+        ));
+        assert!(matches!(
+            user_prompt_submit_additional_context(&"x".repeat(10_001)),
             Err(NativeHookError::InvalidOutput(_))
         ));
     }

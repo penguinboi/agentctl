@@ -14,14 +14,14 @@ use tokio::{fs, process::Command};
 use crate::{config::Config, paths::AgentctlPaths};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CompatibilityReport {
+pub(crate) struct CompatibilityReport {
     pub generated_at: DateTime<Utc>,
     pub live_requested: bool,
     pub checks: Vec<CompatibilityCheck>,
 }
 
 impl CompatibilityReport {
-    pub fn compatible(&self) -> bool {
+    pub(crate) fn compatible(&self) -> bool {
         self.checks
             .iter()
             .all(|check| check.optional || check.status != CheckStatus::Failed)
@@ -29,7 +29,7 @@ impl CompatibilityReport {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CompatibilityCheck {
+pub(crate) struct CompatibilityCheck {
     pub provider: Option<String>,
     pub name: String,
     pub status: CheckStatus,
@@ -39,14 +39,14 @@ pub struct CompatibilityCheck {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CheckStatus {
+pub(crate) enum CheckStatus {
     Passed,
     Warning,
     Failed,
     Skipped,
 }
 
-pub async fn inspect(
+pub(crate) async fn inspect(
     paths: &AgentctlPaths,
     config: &Config,
     live_requested: bool,
@@ -72,7 +72,7 @@ pub async fn inspect(
     }
 }
 
-pub async fn write_report(report: &CompatibilityReport, path: &Path) -> Result<()> {
+pub(crate) async fn write_report(report: &CompatibilityReport, path: &Path) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(report)?;
     fs::write(path, bytes)
         .await
@@ -83,7 +83,10 @@ pub async fn write_report(report: &CompatibilityReport, path: &Path) -> Result<(
 
 /// Executes one disposable, context-bearing model turn. This is intentionally
 /// called only by `doctor --live` because it consumes provider quota.
-pub async fn run_live_turn(provider: &dyn AgentProvider, workspace: &Path) -> CompatibilityCheck {
+pub(crate) async fn run_live_turn(
+    provider: &dyn AgentProvider,
+    workspace: &Path,
+) -> CompatibilityCheck {
     let provider_name = provider.kind().to_string();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(180),

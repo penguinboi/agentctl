@@ -32,7 +32,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
@@ -42,7 +41,7 @@ zstd.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
-agentctl-testkit.workspace = true
+async-trait.workspace = true
 
 [lints]
 workspace = true

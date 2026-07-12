@@ -202,7 +202,7 @@ const fn value(
 /// misspelled or missing value from consuming the following flag. Optional
 /// values are accepted only in attached `--option=value` form so the next
 /// positional token can never be mistaken for an option value.
-pub fn validate(provider: &ProviderKind, args: &[OsString]) -> Result<()> {
+pub(crate) fn validate(provider: &ProviderKind, args: &[OsString]) -> Result<()> {
     let (allowed, owned) = match provider {
         ProviderKind::Claude => (CLAUDE_OPTIONS, CLAUDE_OWNED_OPTIONS),
         ProviderKind::Codex => (CODEX_OPTIONS, CODEX_OWNED_OPTIONS),
@@ -287,7 +287,7 @@ pub fn validate(provider: &ProviderKind, args: &[OsString]) -> Result<()> {
 /// for both native CLIs. Otherwise provider selection itself could turn an
 /// apparently valid invocation into a provider-specific prompt or option after
 /// health probing and routing have already mutated local state.
-pub fn preflight(provider: Option<&ProviderKind>, args: &[OsString]) -> Result<()> {
+pub(crate) fn preflight(provider: Option<&ProviderKind>, args: &[OsString]) -> Result<()> {
     if args.is_empty() {
         return Ok(());
     }

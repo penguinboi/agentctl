@@ -5,6 +5,8 @@ Versioning after 1.0.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-12
+
 - Initial implementation.
 - Native-only workflow: agentctl prepares and captures sessions while the real
   Claude Code or Codex CLI owns the foreground terminal.
@@ -47,3 +49,6 @@ Versioning after 1.0.
 - Native PIDs are journaled before terminal handoff; every post-spawn wrapper
   failure remains `Uncertain`, and unresolved launches without a PID cannot be
   reconciled or abandoned.
+- Removed the disconnected headless routing/approval engine, legacy replay
+  state, unused public APIs, duplicate fixtures, and unnecessary dependency
+  features before the first public release.

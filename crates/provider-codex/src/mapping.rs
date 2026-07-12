@@ -9,7 +9,7 @@ use serde_json::Value;
 
 /// Maps a Codex app-server notification into provider-neutral events.
 /// Unknown notifications are deliberately retained as provider-specific data.
-pub fn map_notification(method: &str, params: &Value) -> Vec<AgentEvent> {
+pub(crate) fn map_notification(method: &str, params: &Value) -> Vec<AgentEvent> {
     let mut mapped = match method {
         "thread/started" => params
             .pointer("/thread/id")
@@ -244,7 +244,7 @@ fn map_file_change(value: &Value) -> Option<FileChange> {
     })
 }
 
-pub fn parse_rate_limit(value: &Value, source: &str) -> Option<RateLimitSnapshot> {
+pub(crate) fn parse_rate_limit(value: &Value, source: &str) -> Option<RateLimitSnapshot> {
     let window = value
         .get("primary")
         .filter(|window| !window.is_null())
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn maps_fixture_sequence() {
-        let fixture = include_str!("../tests/fixtures/turn.jsonl");
+        let fixture = include_str!("../../../fixtures/codex/0.144/turn.jsonl");
         let events = fixture
             .lines()
             .flat_map(|line| {

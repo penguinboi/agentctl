@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
     io,
-    pin::Pin,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -693,10 +692,6 @@ impl AgentProvider for PluginClient {
         PluginClient::shutdown(self).await.map_err(Into::into)
     }
 }
-
-// Keep the public stream alias visible in generated docs without exposing implementation details.
-pub type PluginEventStream =
-    Pin<Box<dyn futures::Stream<Item = Result<AgentEvent, ProviderError>> + Send>>;
 
 #[cfg(test)]
 mod environment_tests {

@@ -23,6 +23,20 @@ jobs:
       - name: Check workspace with MSRV
         run: cargo +1.88.0 check --locked --workspace --all-targets --all-features
 
+  linux-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.0
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build portable Linux release target
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p agentctl
+
   test:
     strategy:
       fail-fast: false
@@ -36,6 +50,11 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check native smoke script
+        if: runner.os == 'Linux'
+        run: |
+          bash -n scripts/native-e2e-smoke.sh
+          shellcheck scripts/native-e2e-smoke.sh
       - run: cargo fmt --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --all-features

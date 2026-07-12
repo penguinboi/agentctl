@@ -36,14 +36,14 @@ impl std::fmt::Display for NativeProcessWasSpawned {
 /// This remains true even when process-tree containment, PID journaling,
 /// terminal handoff, waiting, restoration, or cleanup subsequently failed.
 #[must_use]
-pub fn error_happened_after_spawn(error: &anyhow::Error) -> bool {
+pub(crate) fn error_happened_after_spawn(error: &anyhow::Error) -> bool {
     error.downcast_ref::<NativeProcessWasSpawned>().is_some()
 }
 
 /// Returned only after the native process has exited and its canonical capture
 /// has completed. `main` propagates this code without adding wrapper output.
 #[derive(Clone, Copy, Debug)]
-pub struct NativeExitError {
+pub(crate) struct NativeExitError {
     pub code: i32,
 }
 
@@ -60,14 +60,14 @@ impl std::fmt::Display for NativeExitError {
 impl std::error::Error for NativeExitError {}
 
 #[derive(Clone, Debug, Serialize)]
-pub struct NativeCliSpawn {
+pub(crate) struct NativeCliSpawn {
     pub provider: ProviderKind,
     pub native_session_id: String,
     pub pid: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct NativeCliExit {
+pub(crate) struct NativeCliExit {
     pub provider: ProviderKind,
     pub native_session_id: String,
     /// The provider's ordinary process exit code, when it exited normally.
@@ -84,7 +84,7 @@ impl NativeCliExit {
     /// capturing the native transcript. The module deliberately does not call
     /// `process::exit`, because doing so would skip that post-exit capture.
     #[must_use]
-    pub fn propagated_exit_code(&self) -> Option<i32> {
+    pub(crate) fn propagated_exit_code(&self) -> Option<i32> {
         if self.success {
             return None;
         }
@@ -98,7 +98,7 @@ impl NativeCliExit {
 
 /// Launches Codex with inherited native stdio and invokes `on_spawn`
 /// synchronously as soon as the child PID is available, before waiting for it.
-pub async fn launch_codex_with_spawn<F>(
+pub(crate) async fn launch_codex_with_spawn<F>(
     binary: &str,
     workspace: &Path,
     native_session_id: &str,
@@ -139,7 +139,7 @@ where
 
 /// Launches Claude Code with inherited native stdio and invokes `on_spawn`
 /// synchronously as soon as the child PID is available, before waiting for it.
-pub async fn launch_claude_with_spawn<F>(
+pub(crate) async fn launch_claude_with_spawn<F>(
     binary: &str,
     workspace: &Path,
     native_session_id: &str,
@@ -492,7 +492,7 @@ async fn cleanup_native_descendants(process_tree: &ProcessTree) -> Result<()> {
 }
 
 /// Checks the journaled native process identity after a wrapper crash.
-pub fn native_process_is_running(pid: u32) -> Result<bool> {
+pub(crate) fn native_process_is_running(pid: u32) -> Result<bool> {
     process_root_exists(ProcessGroupId::from_child_id(pid)).map_err(Into::into)
 }
 

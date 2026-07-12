@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use agentctl_telemetry::{PayloadGuard, PayloadLimits, RedactionConfig, RedactionRule, Redactor};
 use anyhow::{Context, Result};
@@ -6,9 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths::AgentctlPaths;
 
+static LEGACY_AFFINITY_WARNED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct Config {
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Config {
     pub routing: RoutingConfig,
     pub retention_days: Option<u64>,
     pub redaction_patterns: Vec<String>,
@@ -16,13 +23,16 @@ pub struct Config {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct RoutingConfig {
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct RoutingConfig {
     pub policy: String,
     pub switch_threshold: f64,
     pub failure_window_seconds: u64,
     pub max_recent_failures: usize,
-    pub affinity: BTreeMap<String, String>,
+    /// Accepted only so pre-0.1 configurations keep loading. Native routing
+    /// occurs before a prompt exists, so category affinity was never applied.
+    #[serde(default, rename = "affinity", skip_serializing)]
+    legacy_affinity: BTreeMap<String, String>,
 }
 
 impl Default for RoutingConfig {
@@ -32,14 +42,14 @@ impl Default for RoutingConfig {
             switch_threshold: 0.25,
             failure_window_seconds: 300,
             max_recent_failures: 2,
-            affinity: BTreeMap::new(),
+            legacy_affinity: BTreeMap::new(),
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct ProviderConfig {
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ProviderConfig {
     pub codex_binary: String,
     pub claude_binary: String,
 }
@@ -54,7 +64,7 @@ impl Default for ProviderConfig {
 }
 
 impl Config {
-    pub fn load(paths: &AgentctlPaths, workspace: &Path) -> Result<Self> {
+    pub(crate) fn load(paths: &AgentctlPaths, workspace: &Path) -> Result<Self> {
         let mut merged = toml::Value::Table(toml::map::Map::new());
         merge_file(&mut merged, &paths.config_file)?;
         merge_project_file(&mut merged, &workspace.join(".agentctl.toml"))?;
@@ -65,10 +75,17 @@ impl Config {
             .try_into()
             .context("agentctl configuration is invalid")?;
         config.validate()?;
+        if !config.routing.legacy_affinity.is_empty()
+            && !LEGACY_AFFINITY_WARNED.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "routing.affinity is deprecated and ignored because native provider selection happens before the prompt"
+            );
+        }
         Ok(config)
     }
 
-    pub fn payload_guard(&self) -> Result<PayloadGuard> {
+    pub(crate) fn payload_guard(&self) -> Result<PayloadGuard> {
         let mut redaction = RedactionConfig::with_secret_defaults();
         redaction
             .rules
@@ -110,14 +127,6 @@ impl Config {
         }
         if self.routing.failure_window_seconds == 0 {
             anyhow::bail!("routing.failure_window_seconds must be at least 1");
-        }
-        for (category, provider) in &self.routing.affinity {
-            if category.trim().is_empty() {
-                anyhow::bail!("routing.affinity category names must not be empty");
-            }
-            if !matches!(provider.as_str(), "auto" | "claude" | "codex") {
-                anyhow::bail!("routing.affinity.{category} must be auto, claude, or codex");
-            }
         }
         if self.providers.codex_binary.trim().is_empty()
             || self.providers.claude_binary.trim().is_empty()
@@ -246,9 +255,6 @@ switch_threshold = 0.4
 failure_window_seconds = 900
 max_recent_failures = 4
 
-[routing.affinity]
-review = "claude"
-
 [providers]
 codex_binary = "/trusted/bin/codex"
 claude_binary = "/trusted/bin/claude"
@@ -264,8 +270,6 @@ switch_threshold = 0.8
 failure_window_seconds = 60
 max_recent_failures = 1
 
-[routing.affinity]
-implementation = "codex"
 "#,
         )
         .unwrap();
@@ -276,13 +280,6 @@ implementation = "codex"
         assert!((config.routing.switch_threshold - 0.8).abs() < f64::EPSILON);
         assert_eq!(config.routing.failure_window_seconds, 60);
         assert_eq!(config.routing.max_recent_failures, 1);
-        assert_eq!(
-            config.routing.affinity,
-            BTreeMap::from([
-                ("implementation".to_owned(), "codex".to_owned()),
-                ("review".to_owned(), "claude".to_owned()),
-            ])
-        );
         assert_eq!(config.retention_days, Some(45));
         assert_eq!(config.redaction_patterns, ["GLOBAL-SECRET"]);
         assert_eq!(config.providers.codex_binary, "/trusted/bin/codex");
@@ -342,6 +339,49 @@ claude_binary = "./malicious-claude"
     }
 
     #[test]
+    fn legacy_affinity_setting_is_accepted_but_not_serialized() {
+        let (_temporary, paths, workspace) = paths_and_workspace();
+        fs::write(
+            workspace.join(".agentctl.toml"),
+            "[routing.affinity]\nreview = 'claude'\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&paths, &workspace).unwrap();
+        assert_eq!(
+            config.routing.legacy_affinity,
+            BTreeMap::from([("review".to_owned(), "claude".to_owned())])
+        );
+        assert!(!toml::to_string(&config).unwrap().contains("affinity"));
+    }
+
+    #[test]
+    fn checked_in_schemas_match_the_supported_routing_surface() {
+        for schema in [
+            include_str!("../../../schemas/config/agentctl.schema.json"),
+            include_str!("../../../schemas/config/agentctl-project.schema.json"),
+        ] {
+            let schema: serde_json::Value = serde_json::from_str(schema).unwrap();
+            let routing = &schema["properties"]["routing"]["properties"];
+            assert_eq!(routing["affinity"]["deprecated"], true);
+            assert_eq!(
+                routing["affinity"]["additionalProperties"]["type"],
+                "string"
+            );
+            assert_eq!(
+                routing["policy"]["enum"],
+                serde_json::json!([
+                    "manual",
+                    "claude-first",
+                    "codex-first",
+                    "balanced",
+                    "sticky-balanced"
+                ])
+            );
+        }
+    }
+
+    #[test]
     fn configured_redaction_patterns_are_compiled_and_applied() {
         let config = Config {
             redaction_patterns: vec![r"ACME-[0-9]{4}".to_owned()],
@@ -378,16 +418,6 @@ claude_binary = "./malicious-claude"
             Config {
                 routing: RoutingConfig {
                     switch_threshold: f64::NAN,
-                    ..RoutingConfig::default()
-                },
-                ..Config::default()
-            },
-            Config {
-                routing: RoutingConfig {
-                    affinity: BTreeMap::from([(
-                        "implementation".to_owned(),
-                        "unknown-provider".to_owned(),
-                    )]),
                     ..RoutingConfig::default()
                 },
                 ..Config::default()

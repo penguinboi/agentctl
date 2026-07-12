@@ -45,7 +45,9 @@ After upgrading `claude` or `codex`:
    without a recorded PID remains fail-closed and cannot be reconciled or
    abandoned.
 
-Redacted provider-version fixtures and fake processes exercise parsers without
-quota use in ordinary CI. Fixtures cover duplicate frames, malformed JSON,
-unknown items, out-of-order events, abrupt exit, quota exhaustion, and repeated
-capture.
+Redacted provider-version fixtures, transport fakes, and parser tests exercise
+the compatibility boundary without quota use in ordinary CI. Together they
+cover malformed JSON recovery, duplicate and out-of-order frames, unknown
+items, abrupt exit, quota exhaustion, repeated capture, and versioned native
+turn shapes. The checked-in corpus is documented in
+[`../fixtures/README.md`](../fixtures/README.md).

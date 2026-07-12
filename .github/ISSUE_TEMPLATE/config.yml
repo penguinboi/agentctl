@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/leofmarciano/agentctl/security/advisories/new
+    about: Send vulnerabilities privately. Never open a public security issue.
+  - name: Read the documentation
+    url: https://github.com/leofmarciano/agentctl/blob/main/docs/README.md
+    about: Architecture, compatibility, security, plugins, and release documentation.

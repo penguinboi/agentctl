@@ -156,21 +156,6 @@ pub struct PluginCapabilities {
     pub extensions: BTreeMap<String, bool>,
 }
 
-impl PluginCapabilities {
-    pub fn as_provider_capabilities(&self) -> BTreeMap<String, bool> {
-        let mut values = self.extensions.clone();
-        values.extend([
-            ("streaming".into(), self.streaming),
-            ("resume".into(), self.resume),
-            ("context_sync".into(), self.context_sync),
-            ("approvals".into(), self.approvals),
-            ("rate_limits".into(), self.rate_limits),
-            ("interruption".into(), self.interruption),
-        ]);
-        values
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct InitializeParams {
     pub protocol_versions: Vec<u32>,

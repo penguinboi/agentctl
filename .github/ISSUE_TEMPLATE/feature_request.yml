@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose an improvement to the native session bridge.
+title: "feature: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is blocked or unnecessarily difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the provider-native workflow, not a replacement chat UI.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and compatibility considerations
+      description: Note effects on native sessions, worktree locking, prompt ownership, or provider protocol compatibility.
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider scope
+      options:
+        - Both providers
+        - Claude Code
+        - Codex
+        - Provider-independent
+    validations:
+      required: true

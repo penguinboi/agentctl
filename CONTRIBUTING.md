@@ -1,9 +1,12 @@
 # Contributing
 
-Use stable Rust and keep provider-specific wire formats outside `agentctl-core`.
-Before opening a pull request, run:
+Use the Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml) and
+keep provider-specific wire formats outside `agentctl-core`. Before opening a
+pull request, run:
 
 ```bash
+bash -n scripts/native-e2e-smoke.sh
+shellcheck scripts/native-e2e-smoke.sh
 cargo fmt --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-features

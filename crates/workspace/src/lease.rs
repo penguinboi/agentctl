@@ -2,7 +2,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use agentctl_core::{TurnId, UnifiedSessionId};
@@ -25,16 +24,7 @@ pub struct LeaseMetadata {
 
 #[derive(Debug)]
 pub struct WorkspaceLease {
-    path: PathBuf,
     file: File,
-    metadata: LeaseMetadata,
-}
-
-#[derive(Debug)]
-pub struct LeaseRecovery {
-    pub lease: WorkspaceLease,
-    pub previous: Option<LeaseMetadata>,
-    pub was_stale: bool,
 }
 
 impl WorkspaceLease {
@@ -85,59 +75,7 @@ impl WorkspaceLease {
             heartbeat_at: now,
         };
         write_metadata(&mut file, &path, &metadata)?;
-        Ok(Self {
-            path,
-            file,
-            metadata,
-        })
-    }
-
-    pub fn recover(
-        lock_directory: impl AsRef<Path>,
-        workspace_fingerprint: impl Into<String>,
-        session_id: UnifiedSessionId,
-        turn_id: TurnId,
-        stale_after: Duration,
-    ) -> Result<LeaseRecovery> {
-        let workspace_fingerprint = workspace_fingerprint.into();
-        let lock_directory = lock_directory.as_ref();
-        create_private_dir(lock_directory)?;
-        let path = lock_path(lock_directory, &workspace_fingerprint);
-        let previous = if path.exists() {
-            let mut file = open_lock_file(&path)?;
-            read_metadata(&mut file).ok()
-        } else {
-            None
-        };
-        let was_stale = previous.as_ref().is_some_and(|metadata| {
-            Utc::now()
-                .signed_duration_since(metadata.heartbeat_at)
-                .to_std()
-                .is_ok_and(|age| age >= stale_after)
-        });
-        let lease = Self::acquire(lock_directory, workspace_fingerprint, session_id, turn_id)?;
-        Ok(LeaseRecovery {
-            lease,
-            previous,
-            was_stale,
-        })
-    }
-
-    pub fn metadata(&self) -> &LeaseMetadata {
-        &self.metadata
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn heartbeat(&mut self) -> Result<()> {
-        self.metadata.heartbeat_at = Utc::now();
-        write_metadata(&mut self.file, &self.path, &self.metadata)
-    }
-
-    pub fn release(self) -> Result<()> {
-        FileExt::unlock(&self.file).map_err(|error| io_error(&self.path, error))
+        Ok(Self { file })
     }
 }
 
@@ -214,20 +152,5 @@ mod tests {
         assert!(matches!(second, Err(WorkspaceError::LeaseBusy(_))));
         drop(first);
         WorkspaceLease::acquire(directory.path(), "workspace", session, turn).unwrap();
-    }
-
-    #[test]
-    fn heartbeat_is_persisted() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut lease = WorkspaceLease::acquire(
-            directory.path(),
-            "workspace",
-            UnifiedSessionId::new(),
-            TurnId::new(),
-        )
-        .unwrap();
-        let before = lease.metadata().heartbeat_at;
-        lease.heartbeat().unwrap();
-        assert!(lease.metadata().heartbeat_at >= before);
     }
 }

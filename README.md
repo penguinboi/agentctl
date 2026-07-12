@@ -1,176 +1,325 @@
 # agentctl
 
-`agentctl` is a local launcher and conversation bridge for the installed
-Claude Code and Codex CLIs.
+**Move one coding session between the native Claude Code and Codex CLIs.**
 
-You still work inside the real `claude` or `codex` interactive terminal. The
-wrapper only prepares the provider session, opens that native CLI in the
-foreground, records the public conversation and relevant workspace effects,
-and projects the delta when you move to the other provider. It never accepts
-chat prompts itself and does not replace either provider's interface, login,
-tools, MCP servers, hooks, permissions, or agent loop.
+[![CI](https://github.com/leofmarciano/agentctl/actions/workflows/ci.yml/badge.svg)](https://github.com/leofmarciano/agentctl/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/leofmarciano/agentctl?display_name=tag&sort=semver)](https://github.com/leofmarciano/agentctl/releases/latest)
+[![Rust MSRV](https://img.shields.io/badge/rustc-1.88%2B-orange.svg)](Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Status:** pre-1.0. Native provider protocols change frequently. Run
-> `agentctl doctor` after upgrading Claude Code or Codex.
-
-## The workflow
-
-Create a canonical session and open Claude Code:
-
-```bash
-cd your-project
-agentctl doctor
-agentctl new --name auth-race --provider claude
-```
-
-`agentctl` now gives the terminal to the installed `claude` binary. Use Claude
-Code normally. When you want Codex to take over:
-
-1. Finish the current native turn.
-2. Exit Claude Code.
-3. Run:
-
-```bash
-agentctl switch codex --session auth-race
-```
-
-The command projects the missing canonical context, then opens the installed
-Codex CLI in the same worktree. To return to Claude Code, exit Codex and run:
-
-```bash
-agentctl switch claude --session auth-race
-```
-
-There is no live provider swap inside an active native process. An ordinary
-switch occurs at a clean process boundary so `agentctl` can capture the
-completed native delta before the other provider starts. If a native process
-crashes mid-turn, a switch is allowed only after its journaled process group is
-proven dead, the provider delta and post-crash workspace snapshot are
-preserved, and a deterministic continuation capsule is committed.
-
-Automatic failover obeys the same boundary. When the launch provider was
-chosen implicitly, and only when no native arguments were forwarded,
-`agentctl` may open the other native CLI after a clean captured exit
-whose recorded health requires fallback. After a recoverable crash it may also
-open the other native CLI with the durable continuation capsule, marked with
-`Possible` or `Confirmed` side effects. It never moves provider execution,
-types or replays the user's prompt, or follows an explicit provider selection
-with another provider. The user submits the continuation inside the newly
-opened native CLI.
-
-Useful launch forms:
-
-```bash
-agentctl                         # open the current session's active provider
-agentctl open claude             # open Claude for the current workspace session
-agentctl open codex --session auth-race
-agentctl resume auth-race        # reopen the session's active native provider
-agentctl new --name prepared --no-launch
-```
-
-Arguments after `--` are forwarded only when they are recognized, bounded
-native options that do not replace the wrapper-owned session, workspace,
-settings overlay, capture hooks, or foreground lifecycle:
-
-```bash
-agentctl new --name auth-race --provider claude -- --model sonnet
-agentctl open claude --session auth-race -- --model sonnet
-agentctl open codex --session auth-race -- --model gpt-5
-```
-
-When the provider is implicit or `auto`, forwarded options must belong to the
-intersection of the Claude and Codex allowlists. Select `--provider` (or use an
-explicit provider argument on `open`/`switch`) for provider-specific flags such
-as Claude `--ax-screen-reader` or Codex `--no-alt-screen`.
-
-Explicitly forwarded native security options are still the user's decision.
-For example, Codex `--sandbox` / `--ask-for-approval` and Claude
-`--permission-mode` can make the native process less restrictive than its
-defaults. `agentctl` never adds those options itself and continues to reject
-the providers' all-in-one bypass flags.
-
-`new` forwards those options to its initial native launch too. Native options
-cannot be combined with `new --no-launch`, because no provider process exists
-to receive them.
-
-Positional arguments are always rejected because both provider CLIs interpret
-one as an initial conversational prompt. Enter prompts only after the native
-interface opens. Unknown options fail closed until their ownership and arity
-are reviewed for the installed provider version.
-
-Provider commands that create, fork, clear, or switch to another native session
-must not be used while a mapped session is open. Exit the provider and use
-`agentctl new`, `agentctl fork`, `agentctl open`, or `agentctl switch` so the
-native identity and canonical history cannot diverge.
-
-## Why the wrapper is required
-
-Starting `claude` or `codex` directly is still possible, but those out-of-band
-turns are not automatically part of an `agentctl` session. The reliable path is
-always:
+`agentctl` is a local session bridge, not another chat client. It opens the
+real `claude` or `codex` interactive terminal in the foreground. You keep the
+provider's native UI, login, tools, MCP servers, hooks, permissions, slash
+commands, and agent loop. When you exit, `agentctl` captures the completed
+public delta; when you switch, it projects that delta into the other provider.
 
 ```text
-agentctl prepares projection
-  -> native provider owns the terminal
-  -> user exits native provider
-  -> agentctl captures and commits the delta
-  -> next provider receives the missing context
+Claude Code (native)  -- exit + capture -->  canonical session
+canonical session    -- project + open -->  Codex (native)
+Codex (native)        -- exit + capture -->  canonical session
+canonical session    -- project + open -->  Claude Code (same native session)
 ```
 
-Do not run the same mapped native session directly or from two terminals at
-once. `agentctl` holds one exclusive writer lease for the worktree for the full
-native process lifetime.
+> **Pre-1.0:** provider protocols change. Run `agentctl doctor` after updating
+> Claude Code or Codex. `agentctl` fails closed when it cannot prove that a
+> handoff is safe.
 
-## What is transferred
+[Quick start](#quick-start) · [Realistic walkthrough](#a-normal-claude--codex--claude-session) · [Installation](#installation) · [Commands](#command-reference) · [How it works](#how-it-works) · [Limits](#compatibility-and-limits)
 
-The canonical event log records the public information needed for semantic
-continuity:
+## Why agentctl exists
 
-- user requests and final assistant responses;
-- public plans and decisions;
-- tool and command outcomes that affect the task;
-- changed-file paths and summarized workspace effects;
-- errors, usage and rate-limit signals when the provider exposes them;
-- projection receipts and native launch/capture state.
+Claude Code and Codex each maintain their own native session history. A useful
+coding task, however, also lives in the worktree: files changed, commands run,
+tests passed, decisions made, and work still open. Starting the other CLI by
+hand loses the reliable link between those pieces.
 
-For Claude, launch-bound hooks observe tool intent and completion. Recognized
-shell and file operations become normalized command and changed-file events.
-`agentctl` also records Git snapshots immediately before and after every native
-launch; an observable Git-state change is retained as a conservative fallback
-when a provider hook does not describe the whole workspace effect.
+`agentctl` adds that link while leaving execution with the native clients:
 
-It deliberately excludes private reasoning, giant logs, complete source files
-that remain readable in the worktree, credentials, and duplicate raw output.
-Oversized Claude hook fields are reduced to bounded summaries, selected
-operational fields, byte counts, and SHA-256 digests instead of being persisted
-verbatim. Large retained diagnostics are stored as content-addressed blobs.
+| `agentctl` owns | Claude Code / Codex still own |
+| --- | --- |
+| Canonical session and audit log | Interactive terminal UI |
+| Native session-ID mapping | Authentication and credentials |
+| Context projection at switch boundaries | Model calls and streaming |
+| Workspace identity and one-writer lock | Tools, MCPs, hooks, and agent loop |
+| Provider health, sync lag, and recovery state | Native permission and sandbox prompts |
 
-The worktree is shared memory too: the next provider sees the current files,
-Git diff, and test state. Context transfer therefore uses a bounded handoff
-capsule instead of copying an ever-growing transcript into every launch.
+There is no `agentctl` prompt box or replacement REPL. You type every
+conversation prompt inside Claude Code or Codex.
 
-### The histories are intentionally asymmetric
+## Quick start
 
-Codex exposes official APIs for reading a thread and injecting external user or
-assistant messages. A Claude-to-Codex handoff can therefore be projected into
-the Codex thread as real transcript messages without starting an extra model
-turn.
+For the complete bridge, install and authenticate both native CLIs first. Then:
+
+```bash
+agentctl doctor
+
+cd ~/code/checkout-api
+agentctl new --name checkout-race --provider claude
+```
+
+Claude Code now owns the terminal. Work normally, finish the current native
+turn, and exit Claude Code. To continue in Codex:
+
+```bash
+agentctl switch codex --session checkout-race
+```
+
+After the Codex turn finishes, exit Codex and return to the mapped Claude
+session:
+
+```bash
+agentctl switch claude --session checkout-race
+```
+
+That process boundary is intentional. `agentctl` never hot-swaps an agent
+under a running native CLI and never types or replays a prompt for you.
+
+## A normal Claude → Codex → Claude session
+
+The following is the intended day-to-day workflow. Lines marked **illustrative
+prompt** are examples typed by the user inside the provider UI; their responses
+depend on the repository, model, and installed provider version.
+
+### 1. Start in native Claude Code
+
+```console
+$ cd ~/code/checkout-api
+$ agentctl new --name checkout-race --provider claude
+
+# The native Claude Code interface opens in this terminal.
+# Illustrative prompt typed inside Claude Code:
+> Find the checkout race, implement the safest fix, and run focused tests.
+```
+
+Review Claude's native tool and permission prompts as usual. When the turn is
+complete, exit the provider cleanly:
+
+```text
+/exit
+```
+
+On process exit, `agentctl` captures the public provider delta and the
+before/after Git state, then releases the worktree lock.
+
+### 2. Hand the same task to native Codex
+
+```console
+$ agentctl switch codex --session checkout-race
+
+# The native Codex interface opens in the same worktree.
+# Illustrative prompt typed inside Codex:
+> Review the race fix already in the worktree. Resolve anything unsafe and run the full tests.
+```
+
+Before opening Codex, `agentctl` synchronizes only the missing canonical
+events. Codex sees the prior public request/result plus the current files and
+Git diff. It is not called in the background while Claude is active.
+
+Finish the native Codex turn and exit:
+
+```text
+/exit
+```
+
+### 3. Return to the same native Claude session
+
+```console
+$ agentctl switch claude --session checkout-race
+
+# The original mapped Claude session resumes.
+# Illustrative prompt typed inside Claude Code:
+> Codex reviewed the change. Give me the final state, remaining risks, and validation results.
+```
+
+Claude receives the Codex handoff as structured historical context on that
+first real user prompt. This timing matters: simply opening and exiting Claude
+does not consume a pending handoff.
+
+### What was actually validated
+
+The repository includes an opt-in PTY smoke test for precisely this native
+boundary. It opens Claude, verifies that a second writer is blocked, exits,
+opens Codex, exits, returns to the same Claude session UUID, and runs sync
+twice to verify idempotency. It submits no model prompt.
+
+For the v0.1.0 launch, this walkthrough was revalidated on 2026-07-12 using
+Claude Code `2.1.207`, Codex CLI `0.144.0`, and `agentctl 0.1.0`. Volatile IDs
+and the disposable path are normalized below:
+
+```console
+$ scripts/native-e2e-smoke.sh
+==> creating disposable Git worktree and canonical session
+==> opening native claude-first UI
+==> verifying the per-worktree writer lock
+==> opening native codex UI
+==> opening native claude-return UI
+==> running projection synchronization twice
+==> native bridge smoke passed
+session: <generated-uuid>
+workspace: <temporary-worktree>
+latest canonical seq: 6
+model prompts submitted: 0
+```
+
+The final status was also checked. This is an abridged rendering of the real
+pretty-JSON output:
+
+```json
+{
+  "session": {
+    "active_provider": { "kind": "claude" },
+    "status": "idle"
+  },
+  "latest_seq": 6,
+  "providers": [
+    {
+      "session": {
+        "provider": { "kind": "claude" },
+        "last_synced_seq": 2,
+        "status": "ready"
+      },
+      "sync_lag": 4
+    },
+    {
+      "session": {
+        "provider": { "kind": "codex" },
+        "last_synced_seq": 6,
+        "status": "ready"
+      },
+      "sync_lag": 0
+    }
+  ]
+}
+```
+
+Claude's lag is expected in this no-prompt test: the Codex → Claude delta is
+delivered by Claude's next `UserPromptSubmit` hook, not by pretending that a
+mere process launch was a durable receipt.
+
+## How it works
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant A as agentctl
+    participant C as Claude Code (native)
+    participant S as Canonical event store
+    participant X as Codex (native)
+
+    User->>A: agentctl new --provider claude
+    A->>C: open mapped session in foreground
+    User->>C: work in the native UI
+    C-->>A: clean process exit
+    A->>S: capture public delta + workspace snapshot
+    User->>A: agentctl switch codex
+    A->>S: read missing events only
+    A->>X: project context and open native CLI
+    User->>X: continue in the native UI
+    X-->>A: clean process exit
+    A->>S: capture public delta + workspace snapshot
+```
+
+Each unified session maps to one native session per provider:
+
+```text
+agentctl session: checkout-race
+├── Claude session: <uuid>
+└── Codex thread:   <thread-id>
+```
+
+The canonical append-only event log is the source of truth. Provider histories
+are projections, and the worktree is shared physical memory. Projection
+receipts are idempotent, synchronization is lazy, and only one native writer
+may own a worktree at a time.
+
+### What is transferred
+
+The bounded handoff can include:
+
+- user requests and final assistant results;
+- public plans, decisions, errors, and open work;
+- command and tool outcomes relevant to the task;
+- changed paths, summarized Git state, and test results;
+- usage or rate-limit signals exposed by the provider;
+- hashes for omitted large content and projection receipts.
+
+It deliberately excludes private reasoning, credentials, giant logs, duplicate
+provider output, and complete files that the next agent can read from disk.
+Large retained diagnostics use content-addressed compressed blobs.
+
+### Why the provider histories are asymmetric
+
+Codex exposes official `thread/read` and `thread/inject_items` APIs. A Claude →
+Codex handoff can therefore become native user/assistant transcript messages
+without starting another model turn.
 
 Claude Code does not expose a public equivalent for inserting an arbitrary
-external assistant message into an existing transcript. A Codex-to-Claude
-handoff is supplied as structured historical context by the first real
-`UserPromptSubmit` hook. Merely opening and exiting Claude does not consume the
-handoff or advance its projection cursor; the delta remains pending for the
-next prompt. Claude receives the meaning of the prior work, but its native
-transcript is not a byte-for-byte copy of the Codex transcript.
+external assistant message. A Codex → Claude handoff is delivered as structured
+historical context by the next real `UserPromptSubmit` hook. Claude gets
+semantic continuity, but its provider-owned transcript is not a byte-for-byte
+copy of the Codex transcript.
 
-`agentctl` promises one auditable canonical conversation and semantic
-continuity, not two identical provider-owned histories. It never edits either
-provider's private transcript files.
+`agentctl` never edits either provider's private transcript JSONL.
 
-## Bringing an existing native chat under agentctl
+## Command reference
 
-First create an empty canonical session without launching a provider:
+Management commands currently render pretty JSON, making session IDs, native
+mappings, sync cursors, and recovery state explicit.
+
+### Open and move sessions
+
+| Command | Purpose |
+| --- | --- |
+| `agentctl` | Open the active provider for the current workspace session. |
+| `agentctl new --name NAME --provider claude\|codex` | Create a canonical session and open the selected native CLI. |
+| `agentctl new --name NAME --no-launch` | Prepare a session without opening a provider. |
+| `agentctl open [claude\|codex] --session SESSION` | Open one mapped provider without changing the canonical session. |
+| `agentctl switch claude\|codex --session SESSION` | Sync the delta, change the active provider, and open its native CLI. |
+| `agentctl resume SESSION` | Reopen the session's active native provider. |
+| `agentctl provider auto\|claude\|codex --session SESSION` | Change automatic or manual provider selection. |
+
+### Inspect and maintain state
+
+| Command | Purpose |
+| --- | --- |
+| `agentctl list` | List canonical sessions. |
+| `agentctl status [SESSION]` | Show provider mappings, health, sync lag, and worktree state. |
+| `agentctl history [SESSION] [--limit N]` | Inspect the canonical public history. |
+| `agentctl metrics [SESSION]` | Inspect local provider, usage, and synchronization aggregates. |
+| `agentctl sync [SESSION]` | Project a pending delta without opening a chat. |
+| `agentctl compact SESSION` | Build a deterministic bounded context checkpoint. |
+| `agentctl fork SESSION --name NAME` | Fork canonical history. |
+| `agentctl export SESSION FILE --include-blobs --redact` | Create a portable, best-effort-redacted export. |
+| `agentctl import FILE` | Import a canonical export. |
+| `agentctl repair` | Check and repair local indexes, blobs, permissions, and receipts. |
+| `agentctl delete SESSION` | Delete a local canonical session. |
+
+Run `agentctl COMMAND --help` for the exact options supported by the installed
+version.
+
+### Passing native options
+
+Arguments after `--` are forwarded only if they are recognized, bounded native
+options that do not replace the wrapper-owned session, worktree, hook overlay,
+or foreground lifecycle:
+
+```bash
+agentctl open claude --session checkout-race -- --model sonnet
+agentctl open codex --session checkout-race -- --no-alt-screen
+```
+
+Unknown options and positional arguments fail closed. A positional argument
+could be interpreted as an initial provider prompt, and `agentctl` never owns
+prompt submission. Provider-specific options require an explicit provider;
+automatic selection accepts only the intersection of both allowlists.
+
+Native security controls explicitly passed by the user remain the user's
+choice. `agentctl` does not add them and rejects each provider's all-in-one
+bypass option.
+
+## Bringing existing chats under agentctl
+
+Create an empty canonical session first:
 
 ```bash
 agentctl new --name imported-work --no-launch
@@ -178,8 +327,8 @@ agentctl new --name imported-work --no-launch
 
 ### Existing Codex thread
 
-Codex has an official history-read API, so `agentctl` can import the supported
-public transcript into an empty canonical session:
+Codex provides an official history API, so its supported public transcript can
+be imported into the canonical event log:
 
 ```bash
 agentctl import-native codex THREAD_ID \
@@ -188,13 +337,11 @@ agentctl import-native codex THREAD_ID \
 agentctl resume imported-work
 ```
 
-The import uses `thread/read(includeTurns=true)`, binds the thread to the same
-worktree, excludes private reasoning and bulky outputs, and is idempotent by
-stable native turn/item identity. It fails closed if the installed Codex
-version returns a partial or unsupported history shape.
+The import uses `thread/read(includeTurns=true)`, excludes private reasoning
+and bulky outputs, and is idempotent by stable native item identity. It fails
+closed for partial or unsupported history shapes.
 
-Use `attach` instead when you only want to continue the thread without copying
-its older public history into the canonical log:
+To continue an existing thread without importing its old public history:
 
 ```bash
 agentctl attach codex THREAD_ID --session imported-work --activate
@@ -202,111 +349,95 @@ agentctl attach codex THREAD_ID --session imported-work --activate
 
 ### Existing Claude Code session
 
-Claude Code does not provide a supported full transcript-read API. `agentctl`
+Claude Code does not expose a supported full transcript-read API. `agentctl`
 can validate and resume an existing session UUID, but cannot retroactively
-import its older transcript:
+import its old transcript:
 
 ```bash
-agentctl attach claude SESSION_UUID \
-  --session imported-work \
-  --activate
+agentctl attach claude SESSION_UUID --session imported-work --activate
 agentctl resume imported-work
 ```
 
-The older history remains available inside Claude Code. New turns made through
-the wrapper are captured canonically and can be transferred from that point
-forward. If the older conversation is needed by Codex, open the attached Claude
-session through `agentctl` and produce an explicit handoff summary as a new
-turn; that new public response can then be projected. There is no lossless,
-automatic import of the pre-attachment Claude transcript.
-
-## Sessions and inspection
-
-These commands manage state; none of them accepts a conversational prompt:
-
-```bash
-agentctl list
-agentctl status auth-race
-agentctl metrics auth-race
-agentctl history auth-race
-agentctl sync auth-race
-agentctl compact auth-race
-agentctl fork auth-race --name auth-race-alt
-agentctl export auth-race session.jsonl --include-blobs --redact
-agentctl repair
-agentctl delete auth-race
-```
-
-`status` shows the active provider, provider health, native session IDs, sync
-lag, and workspace state. `metrics` reads only local canonical data; provider
-usage can be absent or incomplete when the native protocol does not report it.
-
-`sync` projects pending Codex context without opening a native chat. Claude's
-`shouldQuery:false` stream has no durable delivery receipt, so a sync-only
-process never advances Claude's cursor merely because it enqueued that frame.
-Its delta remains canonical and is journaled for delivery by the first real
-`UserPromptSubmit` of the next native Claude launch; the sync report marks that
-cursor as `next_native_user_prompt`. Normal switches already synchronize
-lazily, so explicit sync is mostly useful before going offline or for
-diagnostics. Never run state-changing maintenance while a mapped native CLI is
-still open.
-
-An `Exited` or `Uncertain` native launch is not silently discarded. After
-confirming that its recorded provider process is no longer alive, explicitly
-abandon it and rebuild projection state in the same guarded operation:
-
-```bash
-agentctl repair \
-  --abandon-native-launch LAUNCH_ID \
-  --rebuild-projections
-```
-
-The command reacquires the workspace mutation lease and fails closed if the
-process is still running, the launch/workspace identity does not match, or
-another unresolved launch blocks the rebuild. Any unresolved launch without a
-journaled child PID is deliberately neither reconciled nor abandonable: a
-wrapper crash could have happened in the small spawn-to-journal window, so the
-absence of a PID is not proof that no provider survived. Recovery never asserts
-that uncertain side effects did not happen; inspect canonical history and the
-current worktree before the next native turn.
+New turns made through the wrapper are captured from that point forward. If
+Codex needs the earlier context, produce an explicit public handoff summary in
+the attached Claude session; that new turn can be transferred.
 
 ## Installation
 
-Install and authenticate Claude Code and/or Codex separately first. `agentctl`
-does not acquire, copy, refresh, or store provider credentials.
+### Prerequisites
 
-GitHub Release archives are the supported distribution channel. Download the
-archive for your platform, verify its adjacent checksum, and place `agentctl`
-on `PATH`:
+- Claude Code and/or Codex installed and authenticated directly with their own
+  native login flow;
+- Git available for workspace identity and snapshots;
+- a supported 64-bit Linux, macOS, or Windows host.
+
+`agentctl` never reads, copies, refreshes, or stores provider credentials.
+
+### GitHub Releases
+
+Download the archive and adjacent SHA-256 file from the
+[latest release](https://github.com/leofmarciano/agentctl/releases/latest):
+
+| Platform | Asset |
+| --- | --- |
+| Linux x86_64 (musl) | `agentctl-x86_64-unknown-linux-musl.tar.gz` |
+| macOS Intel | `agentctl-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `agentctl-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `agentctl-x86_64-pc-windows-msvc.zip` |
+
+Example for Apple Silicon macOS:
 
 ```bash
+curl -LO https://github.com/leofmarciano/agentctl/releases/latest/download/agentctl-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/leofmarciano/agentctl/releases/latest/download/agentctl-aarch64-apple-darwin.tar.gz.sha256
 shasum -a 256 -c agentctl-aarch64-apple-darwin.tar.gz.sha256
 tar -xzf agentctl-aarch64-apple-darwin.tar.gz
+mkdir -p "$HOME/.local/bin"
 install -m 0755 agentctl-aarch64-apple-darwin/agentctl "$HOME/.local/bin/agentctl"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-The release matrix currently builds:
+Persist the PATH line in your shell profile if `~/.local/bin` is not already on
+PATH. On Linux, use the `x86_64-unknown-linux-musl` asset and `sha256sum -c`
+instead of `shasum -a 256 -c`; the remaining commands are identical. The musl
+target avoids depending on the build runner's glibc version.
 
-- `x86_64-unknown-linux-gnu`
-- `x86_64-apple-darwin`
-- `aarch64-apple-darwin`
-- `x86_64-pc-windows-msvc`
+On Windows PowerShell, verify and expand the ZIP, then place `agentctl.exe` in a
+directory on PATH:
 
-To build from a checkout, install Rust 1.88 or newer and run:
+```powershell
+$asset = "agentctl-x86_64-pc-windows-msvc"
+Invoke-WebRequest "https://github.com/leofmarciano/agentctl/releases/latest/download/$asset.zip" -OutFile "$asset.zip"
+Invoke-WebRequest "https://github.com/leofmarciano/agentctl/releases/latest/download/$asset.zip.sha256" -OutFile "$asset.zip.sha256"
+$expected = (Get-Content "$asset.zip.sha256").Split()[0]
+$actual = (Get-FileHash "$asset.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "agentctl checksum mismatch" }
+Expand-Archive "$asset.zip" -DestinationPath .
+New-Item -ItemType Directory -Force "$HOME\bin" | Out-Null
+Copy-Item "$asset\agentctl.exe" "$HOME\bin\agentctl.exe"
+```
+
+Add `$HOME\bin` to the user PATH if needed. Every release archive also contains
+this README and the MIT license.
+
+### Build from source
+
+Use the repository's pinned Rust toolchain. The declared MSRV is 1.88:
 
 ```bash
+git clone https://github.com/leofmarciano/agentctl.git
+cd agentctl
 cargo install --locked --path crates/cli
 ```
 
-All workspace packages set `publish = false`; installation from crates.io is
-not supported.
+Workspace packages are intentionally `publish = false`; crates.io installation
+is not supported during pre-1.0 development.
 
 ## Configuration and local state
 
-Global configuration is read from `~/.agentctl/config.toml`. A project-local
-`.agentctl.toml` may override only allowlisted routing fields. A repository
-cannot replace native provider binaries or weaken retention and redaction.
-Use `--home PATH` or `AGENTCTL_HOME` to replace the state directory.
+Global configuration lives at `~/.agentctl/config.toml`. A repository may add
+a restricted `.agentctl.toml` containing routing fields only. Repository config
+cannot replace provider binaries or weaken retention and redaction policy.
 
 ```toml
 retention_days = 30
@@ -319,55 +450,117 @@ failure_window_seconds = 300
 max_recent_failures = 2
 
 [providers]
-codex_binary = "codex"
 claude_binary = "claude"
+codex_binary = "codex"
 ```
 
 Routing policies are `manual`, `claude-first`, `codex-first`, `balanced`, and
-`sticky-balanced`. Routing only selects which native CLI to open at a launch
-boundary; it does not send a prompt to either provider. A health-based fallback
-from an implicitly selected provider can open the other native CLI only after
-the first foreground process exits and capture completes. A mid-turn crash
-additionally requires a dead journaled PID, a durable post-crash snapshot,
-unambiguous handoff state, and a canonical non-replay continuation marker. The
-user still writes the next request inside that native CLI.
+`sticky-balanced`. Routing chooses which native CLI to open at a process
+boundary; it cannot classify a prompt that has not yet been typed.
 
-The state directory contains the SQLite canonical event store, blobs, protocol
-capability evidence, workspace locks, and diagnostic logs. On Unix,
-directories are mode 0700 and sensitive files are mode 0600. Treat the whole
-directory as sensitive source material, not disposable cache.
+Use `AGENTCTL_HOME` or `--home PATH` to isolate or relocate state. The state
+root contains:
 
-The checked-in schemas describe the
-[`global configuration`](schemas/config/agentctl.schema.json) and restricted
-[`project configuration`](schemas/config/agentctl-project.schema.json).
+- the SQLite canonical event store in WAL mode;
+- content-addressed blobs;
+- provider capability evidence and generated Codex schemas;
+- workspace locks, launch journals, and diagnostic logs.
 
-## Compatibility and safety
+On Unix, private directories use mode `0700` and sensitive files use `0600`.
+Treat the entire state directory as source material. Configuration schemas are
+checked in for [global](schemas/config/agentctl.schema.json) and
+[project-local](schemas/config/agentctl-project.schema.json) settings.
 
-`agentctl doctor` checks installed binaries, protocol surfaces, and local state
-without intentionally starting a model turn. `agentctl doctor --live` uses
-disposable sessions to test behavior and may consume provider quota.
+## Compatibility and limits
 
-Provider upgrades can invalidate capture or handoff capabilities. If safe
-synchronization cannot be proved, the provider is marked incompatible or the
-operation fails closed; canonical history is never fabricated. Run
-`agentctl repair` after an interrupted launch when requested. For an
-`Exited`/`Uncertain` launch, use the explicit abandonment and projection rebuild
-form above, then inspect the session before continuing uncertain side effects.
+Read these before trusting an important handoff:
 
-The local database can contain prompts, source-related output, commands, and
-responses. See [`docs/architecture.md`](docs/architecture.md),
-[`docs/protocols.md`](docs/protocols.md),
-[`docs/security.md`](docs/security.md),
-[`docs/compatibility.md`](docs/compatibility.md), and
-[`SECURITY.md`](SECURITY.md).
+- **Exit before switching.** Finish the native turn and leave the provider so
+  capture can complete and the worktree lease can be released.
+- **Open mapped sessions through `agentctl`.** Running the same Claude/Codex
+  session directly or from another terminal is out of band and can make safe
+  migration impossible.
+- **Do not change native session identity from inside a mapped CLI.** Avoid
+  native create, fork, clear, or session-switch commands; exit and use
+  `agentctl new`, `fork`, `open`, or `switch`.
+- **No transcript surgery.** Provider-private transcript files are never
+  edited. Codex and Claude histories are semantically continuous, not
+  identical.
+- **Claude history before attachment is not importable.** Only new captured
+  turns can enter the canonical session automatically.
+- **Automatic failover stops at the UI boundary.** When provider selection was
+  implicit and no native arguments were forwarded, it may open the remaining
+  healthy native CLI after a captured exit or a durable crash continuation.
+  It never overrides an explicit provider or submits or replays a user prompt.
+- **Side effects are never blindly replayed.** Possible or confirmed effects
+  produce a continuation capsule based on current workspace state.
+- **Provider telemetry is asymmetric.** Usage and quota fields can be unknown
+  when a native protocol does not report them.
+- **Pre-1.0 protocols can drift.** Run `agentctl doctor` after every provider
+  upgrade. Use `agentctl doctor --live` only when behavioral probing is needed;
+  live probes may consume quota.
 
-## Release policy
+An interrupted launch can remain `Exited` or `Uncertain`. Confirm its recorded
+provider process is dead, inspect the worktree, and use the explicit guarded
+recovery only when appropriate:
 
-Tags must exactly match the workspace version (`v0.1.0` for version `0.1.0`).
-A release is built only after the reusable CI workflow passes MSRV, formatting,
-Clippy, tests, documentation, license/advisory policy, and vulnerability audit
-checks. See [`docs/releasing.md`](docs/releasing.md).
+```bash
+agentctl repair \
+  --abandon-native-launch LAUNCH_ID \
+  --rebuild-projections
+```
+
+A launch without a journaled PID remains fail-closed because absence of a PID
+does not prove that no provider process survived.
+
+## Security
+
+The canonical database can contain prompts, provider responses, commands, file
+paths, and source-related output. Secret-pattern redaction, ANSI
+neutralization, JSON size/depth limits, path validation, bounded hook capture,
+and content digests are applied before persistence. Raw diagnostic events stay
+separate from normalized product events.
+
+The native provider keeps its normal sandbox and permission UI. `agentctl`
+does not enable `bypassPermissions`, copy provider tokens, or attempt to hide
+usage or bypass quota resets.
+
+For the complete threat and recovery boundary, read [Security and
+privacy](docs/security.md) and the project [security policy](SECURITY.md).
+
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [Architecture](docs/architecture.md)
+- [Native provider protocols](docs/protocols.md)
+- [Compatibility policy](docs/compatibility.md)
+- [Security and privacy](docs/security.md)
+- [Provider plugin authoring](docs/plugin-authoring.md)
+- [Release process](docs/releasing.md)
+- [Commercial distribution gate](docs/commercial-distribution.md)
+- [Architecture decisions](docs/adr/0001-canonical-event-log.md)
+
+## Contributing
+
+Issues and pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md),
+keep provider wire formats behind their adapters, and run the full local gates
+before opening a PR:
+
+```bash
+bash -n scripts/native-e2e-smoke.sh
+shellcheck scripts/native-e2e-smoke.sh
+cargo fmt --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
+cargo doc --locked --workspace --no-deps
+cargo deny check
+cargo audit --deny warnings
+```
+
+Redacted protocol fixtures are preferred over quota-consuming tests. The
+native PTY smoke is intentionally opt-in because it needs installed,
+authenticated providers plus `expect`, `jq`, and Git.
 
 ## License
 
-MIT
+Licensed under the [MIT License](LICENSE).

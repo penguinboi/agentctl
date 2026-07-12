@@ -1,3 +1,0 @@
-{"method":"thread/started","params":{"thread":{"id":"thr_fixture"}}}
-{"method":"item/agentMessage/delta","params":{"delta":"fixture"}}
-{"method":"turn/completed","params":{"turn":{"status":"completed"}}}

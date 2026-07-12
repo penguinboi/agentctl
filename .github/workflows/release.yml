@@ -35,13 +35,11 @@ jobs:
 
   build:
     needs: [quality, verify-tag]
-    permissions:
-      contents: write
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - os: macos-latest
             target: x86_64-apple-darwin
           - os: macos-latest
@@ -49,6 +47,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.96.0
@@ -64,16 +65,16 @@ jobs:
           cp LICENSE README.md "dist/${package}/"
           tar -C dist -czf "${package}.tar.gz" "${package}"
           shasum -a 256 "${package}.tar.gz" > "${package}.tar.gz.sha256"
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          files: |
+          name: agentctl-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
             agentctl-${{ matrix.target }}.tar.gz
             agentctl-${{ matrix.target }}.tar.gz.sha256
 
   build-windows:
     needs: [quality, verify-tag]
-    permissions:
-      contents: write
     runs-on: windows-latest
     env:
       TARGET: x86_64-pc-windows-msvc
@@ -93,9 +94,50 @@ jobs:
           Copy-Item LICENSE, README.md "dist/$package/"
           Compress-Archive -Path "dist/$package" -DestinationPath "$package.zip"
           $hash = (Get-FileHash "$package.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $package.zip" | Set-Content -Encoding ascii "$package.zip.sha256"
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+          "$hash  $package.zip" | Set-Content -Encoding ascii -NoNewline "$package.zip.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          files: |
+          name: agentctl-x86_64-pc-windows-msvc
+          if-no-files-found: error
+          path: |
             agentctl-x86_64-pc-windows-msvc.zip
             agentctl-x86_64-pc-windows-msvc.zip.sha256
+
+  release:
+    needs: [build, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: agentctl-*
+          path: dist
+          merge-multiple: true
+      - name: Verify release bundle
+        working-directory: dist
+        run: |
+          expected=(
+            agentctl-x86_64-unknown-linux-musl.tar.gz
+            agentctl-x86_64-unknown-linux-musl.tar.gz.sha256
+            agentctl-x86_64-apple-darwin.tar.gz
+            agentctl-x86_64-apple-darwin.tar.gz.sha256
+            agentctl-aarch64-apple-darwin.tar.gz
+            agentctl-aarch64-apple-darwin.tar.gz.sha256
+            agentctl-x86_64-pc-windows-msvc.zip
+            agentctl-x86_64-pc-windows-msvc.zip.sha256
+          )
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 8
+          for artifact in "${expected[@]}"; do
+            test -f "$artifact"
+          done
+          for checksum in ./*.sha256; do
+            shasum -a 256 -c "$checksum"
+          done
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          make_latest: true
+          name: agentctl ${{ github.ref_name }}
+          files: dist/*
