@@ -40,12 +40,20 @@ A launch follows this sequence:
 must first leave the currently running native CLI; switching is never a second
 concurrent execution of the same request.
 
-An automatic health fallback is also a launch-boundary operation. After a
-cleanly captured native exit, an implicitly selected launch may open the other
-provider's native CLI while retaining the same worktree lease. It does not
-transfer an in-flight turn or submit the previous prompt again; the user
-decides what to send in the newly opened native interface. Explicit provider
-selections and launches with forwarded native arguments do not auto-fallback.
+An automatic fallback is also a launch-boundary operation. After a cleanly
+captured native exit, an implicitly selected launch may open the other
+provider's native CLI while retaining the same worktree lease. A mid-turn crash
+can cross providers only after the journaled process group is proven dead, the
+provider delta and a post-crash workspace snapshot are durable, and any staged
+handoff is known not to be in an ambiguous delivery state. The coordinator
+then commits a deterministic `native_context_marker` with `Possible` or
+`Confirmed` side effects and `replay_allowed=false` before closing the failed
+launch. The abandoned execution turn becomes terminal `Failed` so it cannot be
+mistaken for a live Claude turn, while its monotonic side-effect state and a
+separate audit event preserve the uncertainty. It opens the other native CLI,
+but never submits the previous prompt; the user decides what continuation to
+send there. Explicit provider selections and launches with forwarded native
+arguments do not auto-fallback.
 
 ## Capture and projection
 
@@ -98,6 +106,14 @@ projection version. Repeating a proven projection is therefore a no-op.
 command, file mutation, background process, or other possible effect, recovery
 must preserve uncertainty and the next user-directed native turn must continue
 from the observed workspace instead of repeating work blindly.
+
+Crash reconciliation is idempotent. The continuation event ID is derived from
+the canonical session and failed launch ID, and it is appended before the
+launch becomes terminal. A second boot therefore either observes the same
+durable marker or still sees an open launch and fails closed. A live process
+group, missing PID receipt, missing workspace snapshot, changed Codex thread
+identity, or Claude handoff in `Delivering`/`Uncertain` state prevents the
+transition.
 
 An unrecoverable `Exited` or `Uncertain` launch can be explicitly abandoned
 only by combining `--abandon-native-launch LAUNCH_ID` with

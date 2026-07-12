@@ -67,15 +67,19 @@ does not claim to preserve the omitted output verbatim.
 
 Claude Code has no public API equivalent to inserting an arbitrary external
 assistant message. A missing Codex delta is therefore rendered as a structured
-handoff capsule and returned as historical `additionalContext` at native
-session start. A stable appended policy tells Claude to treat the capsule as
-untrusted historical data, not higher-priority instructions. Delivery is
-journaled before the projection cursor advances.
+handoff capsule and returned as historical `additionalContext` from the first
+real `UserPromptSubmit` hook. A stable appended policy tells Claude to treat
+the capsule as untrusted historical data, not higher-priority instructions.
+Opening and exiting without a prompt leaves the handoff staged and its cursor
+unchanged; delivery is journaled before the projection cursor advances.
 
 `claude -p` with stream-json may be used for compatibility probes and an
 official resume handshake. It is never used as the user's working interface or
-as a hidden conversation runner. Native transcript files are opaque and are
-never read, modified, or synthesized.
+as a hidden conversation runner. Native transcript contents are opaque and are
+never read, modified, or synthesized. For launch continuity only, agentctl may
+inspect metadata for the official hook-provided `transcript_path` and treat a
+regular, non-symlink, non-empty file named for the exact session UUID as
+evidence that Claude has reserved that session ID.
 
 Independent of provider event detail, `agentctl` records Git snapshots before
 and after each native launch. A changed snapshot contributes a bounded
@@ -97,17 +101,31 @@ The unique receipt prevents duplicate context when synchronization is retried.
 The non-active provider is allowed to lag until the next `open`, `switch`, or
 explicit `sync`.
 
-Health-based automatic failover is eligible only when the launch provider was
-selected implicitly. It can happen only after the foreground native process
-exits and capture succeeds, and it only opens the other provider's native CLI.
-It does not resubmit the prior prompt or continue an in-flight provider turn;
-the user remains responsible for the next request inside the newly opened CLI.
+A local enqueue into a disposable Claude stream-json process is not a native
+receipt. In particular, `shouldQuery:false` cannot advance the Claude cursor in
+the sync-only runtime: shutdown could race the writer before Claude persisted
+the frame. The delta stays in the canonical log, and the next native Claude
+launch writes it to the launch-bound `native_handoffs` journal. Only the
+`UserPromptSubmit` hook's delivery transaction advances that cursor.
+
+Automatic failover is eligible only when the launch provider was selected
+implicitly and no native arguments were forwarded. A health-based fallback
+requires a completed captured exit. A crash fallback additionally requires the
+journaled process group to be proven dead, provider/canonical capture plus a
+post-crash workspace snapshot to succeed, and projection/handoff state to be
+unambiguous. Before opening the other provider's native CLI, agentctl persists
+a deterministic continuation capsule describing `Possible` or `Confirmed`
+side effects and explicitly forbidding replay. It never resubmits the prior
+prompt or continues provider execution; the user remains responsible for the
+next request inside the newly opened CLI.
 
 Provider-native commands or arguments that change session identity, worktree,
 settings ownership, or foreground lifecycle are outside this contract. Exit the
 native CLI and perform those actions with `agentctl` so capture remains bound to
 the correct session. Forwarding is allowlisted and accepts options only;
-positional initial prompts are never accepted by the wrapper.
+positional initial prompts are never accepted by the wrapper. With an implicit
+or automatic provider, every forwarded option must validate against both
+provider allowlists; provider-specific flags require an explicit provider.
 
 ## Existing native sessions
 

@@ -41,6 +41,302 @@ pub fn open_store(paths: &AgentctlPaths) -> Result<AgentctlStore> {
     AgentctlStore::open(&paths.database, &paths.blobs).context("failed to open local state")
 }
 
+#[derive(Clone, Debug)]
+pub struct NativeLaunchWorkspaceSnapshots {
+    pub before: GitSnapshot,
+    pub after: Option<GitSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NativeFailoverContinuation {
+    pub event_id: EventId,
+    pub seq: u64,
+    pub turn_id: Option<TurnId>,
+    pub side_effect_state: SideEffectState,
+}
+
+/// Closes provider turns left operationally active by a dead native process.
+///
+/// `Failed` is the terminal execution disposition; uncertainty remains
+/// explicit in the monotonic side-effect state and in an idempotent audit
+/// event. The audit event is appended first so a crash between the two writes
+/// leaves the turn recoverable on the next boot rather than silently closed.
+pub fn terminalize_native_crash_turns(
+    store: &SqliteStore,
+    guard: &PayloadGuard,
+    session: &UnifiedSession,
+    launch: &NativeLaunchRecord,
+) -> Result<Vec<TurnId>> {
+    ensure!(
+        launch.session_id == session.id,
+        "native crash turn recovery crossed canonical sessions"
+    );
+    let mut recovered = Vec::new();
+    for turn in store.recovery_candidates_for(session.id, &launch.provider)? {
+        let effects = turn.side_effect_state.observe(SideEffectState::Possible);
+        let event_id = deterministic_native_crash_turn_event_id(session.id, launch.id, turn.id);
+        if let Some(existing) = store.event_by_id(event_id)? {
+            ensure!(
+                existing.session_id == session.id
+                    && existing.turn_id == Some(turn.id)
+                    && existing.kind == "native_turn_crash_closed"
+                    && existing
+                        .payload
+                        .get("source_launch_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(launch.id.to_string().as_str()),
+                "deterministic native crash closure event id collision"
+            );
+        } else {
+            let payload = guard.process_json(&serde_json::json!({
+                "source_launch_id": launch.id,
+                "source_provider": launch.provider,
+                "previous_status": turn.status,
+                "terminal_status": TurnStatus::Failed,
+                "side_effect_state": effects,
+                "uncertainty_preserved": true,
+                "replay_allowed": false,
+            }))?;
+            let event = CanonicalEvent {
+                schema_version: 1,
+                session_id: session.id,
+                seq: 0,
+                event_id,
+                turn_id: Some(turn.id),
+                origin_provider: Some(launch.provider.clone()),
+                kind: "native_turn_crash_closed".to_owned(),
+                visibility: EventVisibility::Internal,
+                content_hash: canonical_content_hash(
+                    "native_turn_crash_closed",
+                    EventVisibility::Internal,
+                    &payload,
+                )?,
+                payload,
+                raw_event_id: None,
+                created_at: Utc::now(),
+            };
+            store.append_event_allocating_seq(event, None)?;
+        }
+        store.update_turn_state(
+            turn.id,
+            TurnStatus::Failed,
+            effects,
+            turn.native_turn_id.as_deref(),
+            Utc::now(),
+        )?;
+        recovered.push(turn.id);
+    }
+    Ok(recovered)
+}
+
+/// Finds the workspace evidence belonging to one exact provider launch.
+///
+/// The pre-launch snapshot is mandatory. The post-launch snapshot can be
+/// written by the normal wrapper exit path or by crash reconciliation after
+/// the journaled process group is proven dead.
+pub fn native_launch_workspace_snapshots(
+    store: &SqliteStore,
+    session: &UnifiedSession,
+    launch: &NativeLaunchRecord,
+) -> Result<NativeLaunchWorkspaceSnapshots> {
+    ensure!(
+        launch.session_id == session.id,
+        "native launch snapshot lookup crossed canonical sessions"
+    );
+    let snapshots = store.list_workspace_snapshots(session.id, None)?;
+    let decode = |record: &agentctl_storage::WorkspaceSnapshotRecord| -> Result<GitSnapshot> {
+        ensure!(
+            record.fingerprint == session.workspace_fingerprint,
+            "native launch workspace snapshot fingerprint changed"
+        );
+        serde_json::from_value(record.snapshot.clone())
+            .context("native launch workspace snapshot is invalid")
+    };
+    let before = snapshots
+        .iter()
+        .filter(|record| record.phase == "before_native" && record.created_at <= launch.started_at)
+        .max_by_key(|record| (record.created_at, record.id))
+        .context("native launch has no durable pre-launch workspace snapshot")?;
+    let after = snapshots
+        .iter()
+        .filter(|record| {
+            record.phase.starts_with("after_native") && record.created_at >= launch.started_at
+        })
+        .min_by_key(|record| (record.created_at, record.id))
+        .map(decode)
+        .transpose()?;
+    let before = decode(before)?;
+    if let Some(after) = &after {
+        ensure!(
+            before.root == after.root,
+            "native launch workspace root changed while recovering"
+        );
+    }
+    Ok(NativeLaunchWorkspaceSnapshots { before, after })
+}
+
+/// Persists the only safe cross-provider outcome after a crashed native turn:
+/// a deterministic continuation marker. It never contains or submits a prompt.
+/// The marker is appended before the launch journal is closed, so a crash in
+/// between remains fail-closed and a retry observes the same event id.
+#[allow(clippy::too_many_lines)]
+pub fn persist_native_failover_continuation(
+    store: &SqliteStore,
+    guard: &PayloadGuard,
+    session: &UnifiedSession,
+    launch: &NativeLaunchRecord,
+) -> Result<NativeFailoverContinuation> {
+    ensure!(
+        launch.session_id == session.id,
+        "native failover continuation crossed canonical sessions"
+    );
+    ensure!(
+        matches!(launch.provider, ProviderKind::Claude | ProviderKind::Codex),
+        "plugins cannot own a native failover continuation"
+    );
+    let event_id = deterministic_native_failover_event_id(session.id, launch.id);
+    if let Some(existing) = store.event_by_id(event_id)? {
+        ensure!(
+            existing.session_id == session.id
+                && existing.kind == "native_context_marker"
+                && existing
+                    .payload
+                    .get("source_launch_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(launch.id.to_string().as_str()),
+            "deterministic native failover continuation event id collision"
+        );
+        let side_effect_state = existing
+            .payload
+            .get("side_effect_state")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .context("native failover continuation omitted side-effect state")?;
+        return Ok(NativeFailoverContinuation {
+            event_id,
+            seq: existing.seq,
+            turn_id: existing.turn_id,
+            side_effect_state,
+        });
+    }
+
+    let snapshots = native_launch_workspace_snapshots(store, session, launch)?;
+    let after = snapshots.after.context(
+        "native failover remains blocked until a durable post-crash workspace snapshot exists",
+    )?;
+    let mut side_effect_state = SideEffectState::Possible;
+    if after.changed_since(&snapshots.before) {
+        side_effect_state = SideEffectState::Confirmed;
+    }
+
+    let events = store.list_events(session.id, 0, usize::MAX)?;
+    let mut affected_turns = events
+        .iter()
+        .filter(|event| {
+            event.created_at >= launch.started_at
+                && event.origin_provider.as_ref() == Some(&launch.provider)
+        })
+        .filter_map(|event| event.turn_id)
+        .collect::<BTreeSet<_>>();
+    affected_turns.extend(
+        store
+            .recovery_candidates_for(session.id, &launch.provider)?
+            .into_iter()
+            .filter(|turn| turn.created_at >= launch.started_at)
+            .map(|turn| turn.id),
+    );
+    let mut latest_turn = None;
+    for turn_id in affected_turns {
+        let turn = store
+            .get_turn(turn_id)?
+            .with_context(|| format!("native failover turn {turn_id} disappeared"))?;
+        side_effect_state = side_effect_state.observe(turn.side_effect_state);
+        if latest_turn.as_ref().is_none_or(|latest: &TurnRecord| {
+            (turn.updated_at, turn.id) > (latest.updated_at, latest.id)
+        }) {
+            latest_turn = Some(turn);
+        }
+    }
+    let turn_id = latest_turn.as_ref().map(|turn| turn.id);
+    let last_confirmed_event_seq = events.last().map_or(0, |event| event.seq);
+    let text = format!(
+        "The previous native {} process ended unexpectedly after {} side effects. Continue from the current workspace and canonical history. Do not replay the original request or repeat operations already completed. Inspect the current diff, captured commands, and uncertain operations before the user submits the next instruction in the native CLI.",
+        launch.provider,
+        match side_effect_state {
+            SideEffectState::Possible => "possible",
+            SideEffectState::Confirmed => "confirmed",
+            SideEffectState::None => unreachable!("crash continuation is always conservative"),
+        }
+    );
+    let payload = guard.process_json(&serde_json::json!({
+        "text": text,
+        "marker_kind": "native_failover_continuation",
+        "source_launch_id": launch.id,
+        "source_provider": launch.provider,
+        "side_effect_state": side_effect_state,
+        "continuation": true,
+        "replay_allowed": false,
+        "user_action_required": true,
+        "last_confirmed_event_seq": last_confirmed_event_seq,
+        "before_diff_digest": snapshots.before.diff_digest,
+        "after_diff_digest": after.diff_digest,
+        "changed_paths": after.changed_paths,
+    }))?;
+    let event = CanonicalEvent {
+        schema_version: 1,
+        session_id: session.id,
+        seq: 0,
+        event_id,
+        turn_id,
+        origin_provider: Some(launch.provider.clone()),
+        kind: "native_context_marker".to_owned(),
+        visibility: EventVisibility::Projection,
+        content_hash: canonical_content_hash(
+            "native_context_marker",
+            EventVisibility::Projection,
+            &payload,
+        )?,
+        payload,
+        raw_event_id: None,
+        created_at: Utc::now(),
+    };
+    let event = store.append_event_allocating_seq(event, None)?;
+    Ok(NativeFailoverContinuation {
+        event_id,
+        seq: event.seq,
+        turn_id,
+        side_effect_state,
+    })
+}
+
+fn deterministic_native_failover_event_id(
+    session_id: UnifiedSessionId,
+    launch_id: Uuid,
+) -> EventId {
+    let material = format!("native-failover-continuation\0{session_id}\0{launch_id}");
+    let digest = Sha256::digest(material.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    EventId(Uuid::from_bytes(bytes))
+}
+
+fn deterministic_native_crash_turn_event_id(
+    session_id: UnifiedSessionId,
+    launch_id: Uuid,
+    turn_id: TurnId,
+) -> EventId {
+    let material = format!("native-turn-crash-closed\0{session_id}\0{launch_id}\0{turn_id}");
+    let digest = Sha256::digest(material.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    EventId(Uuid::from_bytes(bytes))
+}
+
 /// Holds every writer lease needed to keep a local state mutation from racing
 /// a provider-owned foreground CLI. The journal check runs only after the OS
 /// lease is acquired, closing the check/start time-of-check window.
@@ -2224,22 +2520,15 @@ pub fn persist_native_attachment(
         "native session id is invalid"
     );
     let canonical_events_before_attach = latest_seq(store, session.id)?;
-    if let Some(existing) = store.provider_session(session.id, &native.provider)? {
+    if let Some(mut existing) = store.provider_session(session.id, &native.provider)? {
         ensure!(
             existing.native_session_id == native.native_session_id,
             "{} already has native session {}; refusing to replace it because existing sync receipts belong to that projection",
             native.provider,
             existing.native_session_id
         );
-        if activate {
-            store.update_session_routing(
-                session.id,
-                Some(&native.provider),
-                "manual",
-                SessionStatus::Active,
-                Utc::now(),
-            )?;
-        }
+        mark_native_session_attached(store, &mut existing)?;
+        activate_native_attachment(store, session.id, &native.provider, activate, Utc::now())?;
         return Ok(NativeAttachmentReport {
             session_id: session.id,
             provider: native.provider.clone(),
@@ -2266,6 +2555,8 @@ pub fn persist_native_attachment(
         capabilities: native.capabilities.clone(),
         metadata: serde_json::json!({
             "attached": true,
+            "native_materialized": true,
+            "native_materialized_by": "official_resume_interface",
             "validation": "official_resume_interface",
             "canonical_history_imported": false,
         }),
@@ -2299,15 +2590,7 @@ pub fn persist_native_attachment(
         created_at: now,
     };
     store.append_event(&event, None)?;
-    if activate {
-        store.update_session_routing(
-            session.id,
-            Some(&native.provider),
-            "manual",
-            SessionStatus::Active,
-            now,
-        )?;
-    }
+    activate_native_attachment(store, session.id, &native.provider, activate, now)?;
     Ok(NativeAttachmentReport {
         session_id: session.id,
         provider: native.provider.clone(),
@@ -2319,6 +2602,48 @@ pub fn persist_native_attachment(
         canonical_events_before_attach,
         warning: "The native transcript remains provider-owned and was not copied into the canonical history.",
     })
+}
+
+fn mark_native_session_attached(
+    store: &SqliteStore,
+    provider: &mut ProviderSessionRecord,
+) -> Result<()> {
+    let metadata = provider
+        .metadata
+        .as_object_mut()
+        .context("provider session metadata must be a JSON object")?;
+    metadata.insert("attached".to_owned(), serde_json::Value::Bool(true));
+    metadata.insert(
+        "native_materialized".to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    metadata.insert(
+        "native_materialized_by".to_owned(),
+        serde_json::Value::String("official_resume_interface".to_owned()),
+    );
+    metadata.remove("native_started");
+    provider.updated_at = Utc::now();
+    store.upsert_provider_session(provider)?;
+    Ok(())
+}
+
+fn activate_native_attachment(
+    store: &SqliteStore,
+    session_id: UnifiedSessionId,
+    provider: &ProviderKind,
+    activate: bool,
+    updated_at: DateTime<Utc>,
+) -> Result<()> {
+    if activate {
+        store.update_session_routing(
+            session_id,
+            Some(provider),
+            "manual",
+            SessionStatus::Active,
+            updated_at,
+        )?;
+    }
+    Ok(())
 }
 
 fn inspect_workspace(path: &Path, recorded_fingerprint: &str) -> WorkspaceStatusView {
@@ -3649,6 +3974,160 @@ mod tests {
         store.append_event(&event, None).unwrap();
     }
 
+    fn record_native_snapshot(
+        store: &SqliteStore,
+        session: &UnifiedSession,
+        phase: &str,
+        digest: &str,
+        created_at: DateTime<Utc>,
+    ) {
+        let snapshot = GitSnapshot {
+            root: session.workspace_path.clone(),
+            head: Some("deadbeef".to_owned()),
+            branch: Some("main".to_owned()),
+            changed_paths: Vec::new(),
+            dirty: false,
+            diff_digest: digest.to_owned(),
+            coverage_complete: true,
+            captured_at: created_at,
+        };
+        store
+            .record_workspace_snapshot(&agentctl_storage::WorkspaceSnapshotRecord {
+                id: EventId::new(),
+                session_id: session.id,
+                turn_id: None,
+                phase: phase.to_owned(),
+                fingerprint: session.workspace_fingerprint.clone(),
+                snapshot: serde_json::to_value(snapshot).unwrap(),
+                diff_digest: Some(digest.to_owned()),
+                created_at,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn crashed_native_failover_is_a_deterministic_non_replay_continuation() {
+        let (_directory, _paths, store, session) = fixture();
+        let identity = WorkspaceIdentity::discover(&session.workspace_path).unwrap();
+        let started_at = Utc::now();
+        record_native_snapshot(
+            &store,
+            &session,
+            "before_native",
+            "sha256:before",
+            started_at - chrono::TimeDelta::milliseconds(1),
+        );
+        record_native_snapshot(
+            &store,
+            &session,
+            "after_native_recovery",
+            "sha256:after",
+            started_at + chrono::TimeDelta::milliseconds(1),
+        );
+        let launch = NativeLaunchRecord {
+            id: Uuid::now_v7(),
+            session_id: session.id,
+            provider: ProviderKind::Claude,
+            native_session_id: Uuid::new_v4().to_string(),
+            workspace_lease_key: identity.lease_key,
+            child_pid: Some(424_242),
+            state: NativeLaunchState::Uncertain,
+            exit_code: Some(1),
+            error: Some("simulated crash".to_owned()),
+            metadata: serde_json::json!({}),
+            started_at,
+            updated_at: started_at,
+        };
+        store
+            .start_native_launch(&NativeLaunchRecord {
+                state: NativeLaunchState::Started,
+                child_pid: None,
+                error: None,
+                ..launch.clone()
+            })
+            .unwrap();
+        store.record_native_launch_pid(launch.id, 424_242).unwrap();
+        store
+            .update_native_launch(
+                launch.id,
+                NativeLaunchState::Uncertain,
+                launch.exit_code,
+                launch.error.as_deref(),
+                Utc::now(),
+            )
+            .unwrap();
+        let launch = store.native_launch(launch.id).unwrap().unwrap();
+        let guard = PayloadGuard::new(PayloadLimits::default(), Redactor::default());
+
+        let first =
+            persist_native_failover_continuation(&store, &guard, &session, &launch).unwrap();
+        let repeated =
+            persist_native_failover_continuation(&store, &guard, &session, &launch).unwrap();
+
+        assert_eq!(first.event_id, repeated.event_id);
+        assert_eq!(first.seq, repeated.seq);
+        assert_eq!(first.side_effect_state, SideEffectState::Confirmed);
+        let markers = store
+            .list_events(session.id, 0, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "native_context_marker")
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].payload["replay_allowed"], false);
+        assert_eq!(markers[0].payload["continuation"], true);
+        let capsule = agentctl_transcript::HandoffCapsule::from_events(
+            session.id,
+            &ProviderKind::Claude,
+            &markers,
+        )
+        .unwrap()
+        .render_xml();
+        assert!(capsule.contains("Do not replay the original request"));
+    }
+
+    #[test]
+    fn crashed_native_failover_without_post_snapshot_stays_fail_closed() {
+        let (_directory, _paths, store, session) = fixture();
+        let identity = WorkspaceIdentity::discover(&session.workspace_path).unwrap();
+        let started_at = Utc::now();
+        record_native_snapshot(
+            &store,
+            &session,
+            "before_native",
+            "sha256:before",
+            started_at - chrono::TimeDelta::milliseconds(1),
+        );
+        let launch = NativeLaunchRecord {
+            id: Uuid::now_v7(),
+            session_id: session.id,
+            provider: ProviderKind::Codex,
+            native_session_id: "thread-crashed".to_owned(),
+            workspace_lease_key: identity.lease_key,
+            child_pid: Some(424_242),
+            state: NativeLaunchState::Uncertain,
+            exit_code: Some(1),
+            error: Some("simulated crash".to_owned()),
+            metadata: serde_json::json!({}),
+            started_at,
+            updated_at: started_at,
+        };
+        let guard = PayloadGuard::new(PayloadLimits::default(), Redactor::default());
+
+        let error = persist_native_failover_continuation(&store, &guard, &session, &launch)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("post-crash workspace snapshot"));
+        assert!(
+            store
+                .list_events(session.id, 0, usize::MAX)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "native_context_marker")
+        );
+    }
+
     fn journal_native_launch(
         store: &SqliteStore,
         session: &UnifiedSession,
@@ -3869,6 +4348,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored.native_session_id, "thread-existing");
         assert_eq!(stored.last_synced_seq, 0);
+        assert_eq!(stored.metadata["native_materialized"], true);
         let event = store.list_events(session.id, 2, 10).unwrap().remove(0);
         assert_eq!(event.kind, "native_session_attached");
         assert_eq!(event.payload["canonical_history_imported"], false);

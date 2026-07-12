@@ -17,7 +17,7 @@ use agentctl_core::{
 use agentctl_provider_claude::native_hooks::{
     NativeHookCommand, NativeHookEvent, SessionEndReason, SessionStartSource, StopFailureKind,
     merge_interactive_hook_settings, parse_hook_payload_for_session,
-    session_start_additional_context,
+    user_prompt_submit_additional_context,
 };
 use agentctl_storage::{
     AgentctlStore, NativeHandoffRecord, NativeHandoffState, NativeLaunchRecord, NativeLaunchState,
@@ -40,6 +40,8 @@ const MAX_STDIN_BYTES: u64 = 8 * 1024 * 1024 + 1;
 const MAX_HANDOFF_CONTEXT_CHARS: usize = 9_500;
 const EVENT_PAGE_SIZE: usize = 512;
 const TOOL_SUMMARY_BYTES: usize = 8 * 1024;
+const CLAUDE_MATERIALIZED_KEY: &str = "native_materialized";
+const CLAUDE_LEGACY_STARTED_KEY: &str = "native_started";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ClaudeHandoffStage {
@@ -93,14 +95,8 @@ pub fn prepare_native_claude(
         identity.execution_root() == session.workspace_path,
         "native Claude workspace identity no longer matches the canonical session"
     );
+    let resume = reconcile_claude_materialization(store, session.id)?;
     let existing = store.provider_session(session.id, &ProviderKind::Claude)?;
-    let resume = existing.as_ref().is_some_and(|record| {
-        record
-            .metadata
-            .get("native_started")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-    });
     let native_session_id = existing.as_ref().map_or_else(
         || Uuid::new_v4().to_string(),
         |record| record.native_session_id.clone(),
@@ -166,7 +162,10 @@ pub fn prepare_native_claude(
             status: ProviderStatus::Unknown,
             reset_at: None,
             capabilities: BTreeMap::from([("native_hooks".to_owned(), true)]),
-            metadata: json!({"mode": "native_interactive", "native_started": false}),
+            metadata: json!({
+                "mode": "native_interactive",
+                "native_materialized": false,
+            }),
             created_at: now,
             updated_at: now,
         };
@@ -305,17 +304,28 @@ pub async fn run_native_claude(
         let provider = store
             .provider_session(session.id, &ProviderKind::Claude)?
             .context("Claude provider session disappeared after native exit")?;
-        if store
-            .native_handoff(prepared.launch_id)?
+        let handoff = store.native_handoff(prepared.launch_id)?;
+        if handoff
+            .as_ref()
             .is_some_and(|handoff| handoff.state == NativeHandoffState::Delivering)
         {
             store.mark_native_handoff_uncertain(prepared.launch_id)?;
         }
         if let Some(through) = prepared.handoff_through {
-            ensure!(
-                provider.last_synced_seq >= through,
-                "Claude exited before its SessionStart hook acknowledged the staged handoff"
-            );
+            let handoff = handoff.context("prepared Claude handoff journal disappeared")?;
+            match handoff.state {
+                NativeHandoffState::Staged => {
+                    // No prompt was submitted. The delta remains pending and
+                    // will be staged again for the next native launch.
+                }
+                NativeHandoffState::Delivered => ensure!(
+                    provider.last_synced_seq >= through,
+                    "Claude handoff was delivered without advancing its projection cursor"
+                ),
+                NativeHandoffState::Delivering | NativeHandoffState::Uncertain => {
+                    bail!("Claude handoff delivery is uncertain; run agentctl repair")
+                }
+            }
         }
         let unfinished = active_claude_turns(store, session.id)?;
         if !unfinished.is_empty() {
@@ -610,14 +620,7 @@ async fn handle_claude_hook_inner(
                 && matches!(event, NativeHookEvent::SessionEnd(_))),
         "native Claude launch is not accepting hook events"
     );
-    if !matches!(event, NativeHookEvent::SessionStart(_))
-        && let Some(handoff) = store.native_handoff(launch_id)?
-    {
-        ensure!(
-            handoff.state == NativeHandoffState::Delivered,
-            "Claude handoff delivery is not durable; exit the native CLI and repair"
-        );
-    }
+    ensure_handoff_allows_event(store, launch_id, &event)?;
     validate_workspace(&session, event.common().cwd.as_path())?;
     let raw: Value = serde_json::from_slice(&bytes)?;
     let guard = config.payload_guard()?;
@@ -631,49 +634,15 @@ async fn handle_claude_hook_inner(
         &raw,
     )?;
 
-    if matches!(event, NativeHookEvent::SessionStart(_))
-        && let Some(staged) = store.native_handoff(launch_id)?
-        && staged.state != NativeHandoffState::Delivered
-    {
-        staged.validate_for_delivery(session.id, &args.expected_native_session)?;
-        ensure!(
-            staged.capsule.chars().count() <= MAX_HANDOFF_CONTEXT_CHARS,
-            "Claude handoff exceeds the native hook context budget; compact the session"
-        );
-        ensure!(
-            staged.content_digest
-                == stage_digest(
-                    staged.session_id,
-                    &staged.native_session_id,
-                    staged.through_seq,
-                    &staged.capsule,
-                ),
-            "journaled Claude handoff digest is invalid"
-        );
-        let delivering = store.begin_native_handoff_delivery(launch_id)?;
-        let output = session_start_additional_context(&delivering.capsule)?;
+    if matches!(event, NativeHookEvent::UserPromptSubmit(_)) {
         let mut stdout = std::io::stdout().lock();
-        if let Err(error) = serde_json::to_writer(&mut stdout, &output)
-            .and_then(|()| stdout.write_all(b"\n").map_err(serde_json::Error::io))
-            .and_then(|()| stdout.flush().map_err(serde_json::Error::io))
-        {
-            let _ = store.mark_native_handoff_uncertain(launch_id);
-            return Err(error.into());
-        }
-        if let Err(error) = store.complete_native_handoff_delivery(launch_id, Utc::now()) {
-            let _ = store.mark_native_handoff_uncertain(launch_id);
-            let _ = store.update_native_launch(
-                launch_id,
-                NativeLaunchState::Uncertain,
-                None,
-                Some("Claude received handoff output but the delivery receipt was not committed"),
-                Utc::now(),
-            );
-            tracing::error!(%error, %launch_id, "handoff was written to Claude but cursor commit failed");
-            // Claude received the context. Returning another JSON document would
-            // corrupt hook stdout; the uncertain journal blocks future transfer.
-            return Ok(());
-        }
+        deliver_staged_handoff(
+            store,
+            session.id,
+            &args.expected_native_session,
+            launch_id,
+            &mut stdout,
+        )?;
     }
     tracing::debug!(
         session_id = %session.id,
@@ -690,6 +659,97 @@ struct PersistOutcome {
     turn_id: Option<TurnId>,
     events_written: usize,
     duplicate: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoffDelivery {
+    None,
+    Delivered,
+    ReceiptUncertain,
+}
+
+fn ensure_handoff_allows_event(
+    store: &AgentctlStore,
+    launch_id: Uuid,
+    event: &NativeHookEvent,
+) -> Result<()> {
+    let Some(handoff) = store.native_handoff(launch_id)? else {
+        return Ok(());
+    };
+    match handoff.state {
+        NativeHandoffState::Delivered => Ok(()),
+        NativeHandoffState::Staged
+            if matches!(
+                event,
+                NativeHookEvent::SessionStart(_)
+                    | NativeHookEvent::UserPromptSubmit(_)
+                    | NativeHookEvent::SessionEnd(_)
+            ) =>
+        {
+            Ok(())
+        }
+        NativeHandoffState::Staged => {
+            bail!("Claude emitted effects before its staged handoff reached UserPromptSubmit")
+        }
+        NativeHandoffState::Delivering | NativeHandoffState::Uncertain => {
+            bail!("Claude handoff delivery is uncertain; exit the native CLI and repair")
+        }
+    }
+}
+
+fn deliver_staged_handoff(
+    store: &AgentctlStore,
+    session_id: UnifiedSessionId,
+    native_session_id: &str,
+    launch_id: Uuid,
+    writer: &mut impl Write,
+) -> Result<HandoffDelivery> {
+    let Some(staged) = store.native_handoff(launch_id)? else {
+        return Ok(HandoffDelivery::None);
+    };
+    match staged.state {
+        NativeHandoffState::Delivered => return Ok(HandoffDelivery::None),
+        NativeHandoffState::Staged => {}
+        NativeHandoffState::Delivering | NativeHandoffState::Uncertain => {
+            bail!("Claude handoff delivery is uncertain; exit the native CLI and repair")
+        }
+    }
+    staged.validate_for_delivery(session_id, native_session_id)?;
+    ensure!(
+        staged.capsule.chars().count() <= MAX_HANDOFF_CONTEXT_CHARS,
+        "Claude handoff exceeds the native hook context budget; compact the session"
+    );
+    ensure!(
+        staged.content_digest
+            == stage_digest(
+                staged.session_id,
+                &staged.native_session_id,
+                staged.through_seq,
+                &staged.capsule,
+            ),
+        "journaled Claude handoff digest is invalid"
+    );
+    let output = user_prompt_submit_additional_context(&staged.capsule)?;
+    store.begin_native_handoff_delivery(launch_id)?;
+    if let Err(error) = write_hook_json_to(writer, &output) {
+        let _ = store.mark_native_handoff_uncertain(launch_id);
+        return Err(error);
+    }
+    if let Err(error) = store.complete_native_handoff_delivery(launch_id, Utc::now()) {
+        let _ = store.mark_native_handoff_uncertain(launch_id);
+        let _ = store.update_native_launch(
+            launch_id,
+            NativeLaunchState::Uncertain,
+            None,
+            Some("Claude received handoff output but the delivery receipt was not committed"),
+            Utc::now(),
+        );
+        tracing::error!(%error, %launch_id, "handoff was written to Claude but cursor commit failed");
+        // Claude received the context. Returning another JSON document would
+        // corrupt hook stdout; the uncertain journal blocks future transfer.
+        return Ok(HandoffDelivery::ReceiptUncertain);
+    }
+    Ok(HandoffDelivery::Delivered)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -713,7 +773,6 @@ fn persist_hook_event(
             let mut provider =
                 ensure_provider_binding(store, session.id, expected_native_session_id, true)?;
             if let Some(metadata) = provider.metadata.as_object_mut() {
-                metadata.insert("native_started".to_owned(), Value::Bool(true));
                 metadata.insert(
                     "mode".to_owned(),
                     Value::String("native_interactive".to_owned()),
@@ -787,6 +846,7 @@ fn persist_hook_event(
                         ),
                         Some(("claude_hook_user_prompt_submit", &raw)),
                     )?;
+                    mark_claude_materialized(store, session.id, "user_prompt_submit")?;
                     return Ok(PersistOutcome {
                         turn_id: Some(turn.id),
                         events_written: usize::from(inserted),
@@ -859,6 +919,7 @@ fn persist_hook_event(
             if duplicate {
                 validate_idempotent_event(store, &stored_event, &expected_event, Some(&raw))?;
             }
+            mark_claude_materialized(store, session.id, "user_prompt_submit")?;
             Ok(PersistOutcome {
                 turn_id: Some(turn_id),
                 events_written: usize::from(!duplicate),
@@ -930,9 +991,16 @@ fn persist_hook_event(
                 .pointer("/payload/last_assistant_message")
                 .and_then(Value::as_str),
         ),
-        NativeHookEvent::SessionEnd(end) => {
-            persist_session_end(store, session.id, launch_id, &normalized, &raw, end.reason)
-        }
+        NativeHookEvent::SessionEnd(end) => persist_session_end(
+            store,
+            session.id,
+            expected_native_session_id,
+            launch_id,
+            &end.common.transcript_path,
+            &normalized,
+            &raw,
+            end.reason,
+        ),
     }
 }
 
@@ -1416,10 +1484,13 @@ fn persist_stop_failure(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn persist_session_end(
     store: &AgentctlStore,
     session_id: UnifiedSessionId,
+    native_session_id: &str,
     launch_id: Uuid,
+    transcript_path: &Path,
     normalized: &Value,
     raw: &Value,
     reason: SessionEndReason,
@@ -1496,11 +1567,12 @@ fn persist_session_end(
             written += 1;
         }
     }
+    if native_transcript_materialized(transcript_path, native_session_id)? {
+        mark_claude_materialized(store, session_id, "nonempty_transcript_path")?;
+    }
     let provider = store
         .provider_session(session_id, &ProviderKind::Claude)?
         .context("SessionEnd could not find the bound Claude provider session")?;
-    let captured_through = store.next_seq(session_id)?.saturating_sub(1);
-    store.advance_provider_cursor(provider.id, captured_through)?;
     store.update_session_state(
         session_id,
         Some(&ProviderKind::Claude),
@@ -1514,11 +1586,22 @@ fn persist_session_end(
         launch.session_id == session_id && launch.provider == ProviderKind::Claude,
         "SessionEnd native launch binding mismatch"
     );
-    if let Some(handoff) = store.native_handoff(launch_id)? {
+    let handoff = store.native_handoff(launch_id)?;
+    if let Some(handoff) = &handoff {
         ensure!(
-            handoff.state == NativeHandoffState::Delivered,
-            "SessionEnd arrived before the staged Claude handoff was durably delivered"
+            matches!(
+                handoff.state,
+                NativeHandoffState::Staged | NativeHandoffState::Delivered
+            ),
+            "SessionEnd arrived with an uncertain Claude handoff delivery"
         );
+    }
+    if handoff
+        .as_ref()
+        .is_none_or(|handoff| handoff.state == NativeHandoffState::Delivered)
+    {
+        let captured_through = store.next_seq(session_id)?.saturating_sub(1);
+        store.advance_provider_cursor(provider.id, captured_through)?;
     }
     store.update_native_launch(
         launch_id,
@@ -1549,7 +1632,12 @@ fn build_handoff_stage(
     let source = delta
         .iter()
         .rev()
-        .find_map(|event| event.origin_provider.clone())
+        .find_map(|event| {
+            (event.visibility != EventVisibility::Internal
+                && event.origin_provider.as_ref() != Some(&ProviderKind::Claude))
+            .then(|| event.origin_provider.clone())
+            .flatten()
+        })
         .unwrap_or(ProviderKind::Codex);
     let mut capsule = HandoffCapsule::from_events(session_id, &source, &delta)?;
     capsule.through_seq = through_seq;
@@ -1690,7 +1778,10 @@ fn ensure_provider_binding(
         status: ProviderStatus::Ready,
         reset_at: None,
         capabilities: BTreeMap::from([("native_hooks".to_owned(), true)]),
-        metadata: json!({"mode": "native_interactive"}),
+        metadata: json!({
+            "mode": "native_interactive",
+            "native_materialized": false,
+        }),
         created_at: now,
         updated_at: now,
     };
@@ -1698,7 +1789,187 @@ fn ensure_provider_binding(
     Ok(record)
 }
 
-fn active_claude_turn(
+/// Reconciles the durable-session marker used to choose Claude's `--resume`.
+///
+/// Older agentctl versions recorded `native_started` at `SessionStart`, even
+/// though Claude does not always persist an interrupted empty conversation.
+/// That legacy bit is deliberately ignored. A native transcript is known to
+/// exist after a captured Claude prompt, an explicit attachment, or a
+/// previously captured `SessionEnd` whose official transcript path still
+/// points to a non-empty transcript for this exact native session id.
+pub(crate) fn reconcile_claude_materialization(
+    store: &AgentctlStore,
+    session_id: UnifiedSessionId,
+) -> Result<bool> {
+    let Some(mut provider) = store.provider_session(session_id, &ProviderKind::Claude)? else {
+        return Ok(false);
+    };
+    let metadata_materialized = provider
+        .metadata
+        .get(CLAUDE_MATERIALIZED_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let attached = provider
+        .metadata
+        .get("attached")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let canonical_prompt =
+        !metadata_materialized && !attached && canonical_claude_prompt_exists(store, session_id)?;
+    let canonical_transcript = !metadata_materialized
+        && !attached
+        && !canonical_prompt
+        && canonical_claude_transcript_exists(store, session_id, &provider.native_session_id)?;
+    let materialized =
+        metadata_materialized || attached || canonical_prompt || canonical_transcript;
+
+    let metadata = provider
+        .metadata
+        .as_object_mut()
+        .context("Claude provider metadata must be a JSON object")?;
+    let needs_update = metadata
+        .get(CLAUDE_MATERIALIZED_KEY)
+        .and_then(Value::as_bool)
+        != Some(materialized)
+        || metadata.contains_key(CLAUDE_LEGACY_STARTED_KEY);
+    if needs_update {
+        metadata.insert(
+            CLAUDE_MATERIALIZED_KEY.to_owned(),
+            Value::Bool(materialized),
+        );
+        if materialized && !metadata.contains_key("native_materialized_by") {
+            metadata.insert(
+                "native_materialized_by".to_owned(),
+                Value::String(
+                    if attached {
+                        "official_resume_interface"
+                    } else if canonical_prompt {
+                        "canonical_user_prompt"
+                    } else if canonical_transcript {
+                        "canonical_session_end_transcript"
+                    } else {
+                        "persisted_metadata"
+                    }
+                    .to_owned(),
+                ),
+            );
+        }
+        metadata.remove(CLAUDE_LEGACY_STARTED_KEY);
+        provider.updated_at = Utc::now();
+        store.upsert_provider_session(&provider)?;
+    }
+    Ok(materialized)
+}
+
+fn mark_claude_materialized(
+    store: &AgentctlStore,
+    session_id: UnifiedSessionId,
+    evidence: &'static str,
+) -> Result<()> {
+    let mut provider = store
+        .provider_session(session_id, &ProviderKind::Claude)?
+        .context("Claude materialization evidence could not find its bound provider session")?;
+    let metadata = provider
+        .metadata
+        .as_object_mut()
+        .context("Claude provider metadata must be a JSON object")?;
+    metadata.insert(CLAUDE_MATERIALIZED_KEY.to_owned(), Value::Bool(true));
+    metadata
+        .entry("native_materialized_by".to_owned())
+        .or_insert_with(|| Value::String(evidence.to_owned()));
+    metadata.remove(CLAUDE_LEGACY_STARTED_KEY);
+    provider.updated_at = Utc::now();
+    store.upsert_provider_session(&provider)?;
+    Ok(())
+}
+
+fn native_transcript_materialized(path: &Path, native_session_id: &str) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect Claude transcript {}", path.display())
+            });
+        }
+    };
+    ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "Claude transcript path is not a regular non-symlink file"
+    );
+    if metadata.len() == 0 {
+        return Ok(false);
+    }
+    let expected_name = format!("{native_session_id}.jsonl");
+    ensure!(
+        path.file_name().and_then(|name| name.to_str()) == Some(expected_name.as_str()),
+        "Claude transcript filename does not match its native session id"
+    );
+    Ok(true)
+}
+
+fn canonical_claude_prompt_exists(
+    store: &AgentctlStore,
+    session_id: UnifiedSessionId,
+) -> Result<bool> {
+    let mut after_seq = 0;
+    loop {
+        let page = store.list_events(session_id, after_seq, EVENT_PAGE_SIZE)?;
+        if page.iter().any(|event| {
+            event.kind == "user_prompt"
+                && event.origin_provider.as_ref() == Some(&ProviderKind::Claude)
+        }) {
+            return Ok(true);
+        }
+        let Some(last) = page.last() else {
+            return Ok(false);
+        };
+        after_seq = last.seq;
+        if page.len() < EVENT_PAGE_SIZE {
+            return Ok(false);
+        }
+    }
+}
+
+fn canonical_claude_transcript_exists(
+    store: &AgentctlStore,
+    session_id: UnifiedSessionId,
+    native_session_id: &str,
+) -> Result<bool> {
+    let mut after_seq = 0;
+    loop {
+        let page = store.list_events(session_id, after_seq, EVENT_PAGE_SIZE)?;
+        for event in &page {
+            if event.origin_provider.as_ref() != Some(&ProviderKind::Claude) {
+                continue;
+            }
+            let Some(raw_id) = event.raw_event_id else {
+                continue;
+            };
+            let Some(raw) = store.raw_event(raw_id)? else {
+                continue;
+            };
+            if raw.kind != "claude_hook_session_end" {
+                continue;
+            }
+            let Some(path) = raw.payload.get("transcript_path").and_then(Value::as_str) else {
+                continue;
+            };
+            if native_transcript_materialized(Path::new(path), native_session_id)? {
+                return Ok(true);
+            }
+        }
+        let Some(last) = page.last() else {
+            return Ok(false);
+        };
+        after_seq = last.seq;
+        if page.len() < EVENT_PAGE_SIZE {
+            return Ok(false);
+        }
+    }
+}
+
+pub(crate) fn active_claude_turn(
     store: &AgentctlStore,
     session_id: UnifiedSessionId,
 ) -> Result<Option<TurnRecord>> {
@@ -2218,9 +2489,14 @@ fn record_session_divergence(
 
 fn write_hook_json(value: &Value) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, value)?;
-    stdout.write_all(b"\n")?;
-    stdout.flush()?;
+    write_hook_json_to(&mut stdout, value)?;
+    Ok(())
+}
+
+fn write_hook_json_to(writer: &mut impl Write, value: &Value) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -2366,7 +2642,7 @@ pub(crate) fn parse_claude_semver(value: &str) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use agentctl_core::{AuthMode, SessionStatus};
+    use agentctl_core::{AuthMode, NativeSession, SessionStatus};
     use agentctl_provider_claude::native_hooks::parse_hook_payload;
     use agentctl_telemetry::{PayloadLimits, RedactionConfig, Redactor};
     use tempfile::TempDir;
@@ -2440,6 +2716,10 @@ mod tests {
         }
 
         fn persist(&self, raw: &Value) -> Result<PersistOutcome> {
+            self.persist_for_launch(self.launch_id, raw)
+        }
+
+        fn persist_for_launch(&self, launch_id: Uuid, raw: &Value) -> Result<PersistOutcome> {
             let bytes = serde_json::to_vec(raw)?;
             let event = parse_hook_payload(&bytes)?;
             persist_hook_event(
@@ -2447,7 +2727,7 @@ mod tests {
                 &self.guard,
                 &self.session,
                 &self.native_session_id,
-                self.launch_id,
+                launch_id,
                 &event,
                 raw,
             )
@@ -2490,6 +2770,322 @@ mod tests {
             ))
             .unwrap()
         }
+
+        #[cfg(unix)]
+        fn claude_config(&self) -> Config {
+            use std::os::unix::fs::PermissionsExt;
+
+            let fake_claude = self.root.path().join("claude-materialization-test");
+            fs::write(&fake_claude, "#!/bin/sh\necho '2.1.139 (Claude Code)'\n").unwrap();
+            fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut config = Config::default();
+            config.providers.claude_binary = fake_claude.to_string_lossy().into_owned();
+            config
+        }
+
+        fn end_and_capture(&self) {
+            self.persist(&self.raw("SessionEnd", json!({"reason": "prompt_input_exit"})))
+                .unwrap();
+            assert!(record_native_child_exit(&self.store, self.launch_id, Some(0)).unwrap());
+        }
+
+        fn end_with_nonempty_transcript_and_capture(&self) -> PathBuf {
+            let transcript = self
+                .root
+                .path()
+                .join(format!("{}.jsonl", self.native_session_id));
+            fs::write(&transcript, "{\"type\":\"session\"}\n").unwrap();
+            self.persist(&self.raw(
+                "SessionEnd",
+                json!({
+                    "reason": "prompt_input_exit",
+                    "transcript_path": transcript,
+                }),
+            ))
+            .unwrap();
+            assert!(record_native_child_exit(&self.store, self.launch_id, Some(0)).unwrap());
+            transcript
+        }
+
+        fn rewrite_as_legacy_started_metadata(&self) {
+            let mut provider = self
+                .store
+                .provider_session(self.session.id, &ProviderKind::Claude)
+                .unwrap()
+                .unwrap();
+            let metadata = provider.metadata.as_object_mut().unwrap();
+            metadata.remove(CLAUDE_MATERIALIZED_KEY);
+            metadata.remove("native_materialized_by");
+            metadata.insert(CLAUDE_LEGACY_STARTED_KEY.to_owned(), Value::Bool(true));
+            provider.updated_at = Utc::now();
+            self.store.upsert_provider_session(&provider).unwrap();
+        }
+
+        fn append_codex_result(&self, text: &str) {
+            let payload = json!({"text": text});
+            self.store
+                .append_event_allocating_seq(
+                    CanonicalEvent {
+                        schema_version: 1,
+                        session_id: self.session.id,
+                        seq: 0,
+                        event_id: EventId::new(),
+                        turn_id: None,
+                        origin_provider: Some(ProviderKind::Codex),
+                        kind: "assistant_final".to_owned(),
+                        visibility: EventVisibility::User,
+                        content_hash: canonical_content_hash(
+                            "assistant_final",
+                            EventVisibility::User,
+                            &payload,
+                        )
+                        .unwrap(),
+                        payload,
+                        raw_event_id: None,
+                        created_at: Utc::now(),
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_claude_launch_does_not_resume_an_unmaterialized_transcript() {
+        let fixture = Fixture::new();
+        fixture.start();
+        assert_eq!(
+            fixture
+                .store
+                .provider_session(fixture.session.id, &ProviderKind::Claude)
+                .unwrap()
+                .unwrap()
+                .metadata[CLAUDE_MATERIALIZED_KEY],
+            false
+        );
+        fixture.end_and_capture();
+        fixture.rewrite_as_legacy_started_metadata();
+
+        let prepared = prepare_native_claude(
+            &fixture.store,
+            &fixture.paths,
+            &fixture.claude_config(),
+            &fixture.session,
+            &WorkspaceIdentity::discover(fixture.workspace.path()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.native_session_id, fixture.native_session_id);
+        assert!(
+            !prepared.resume,
+            "empty Claude launch must use --session-id"
+        );
+        let metadata = fixture
+            .store
+            .provider_session(fixture.session.id, &ProviderKind::Claude)
+            .unwrap()
+            .unwrap()
+            .metadata;
+        assert_eq!(metadata[CLAUDE_MATERIALIZED_KEY], false);
+        assert!(metadata.get(CLAUDE_LEGACY_STARTED_KEY).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_launch_resumes_after_the_first_canonical_prompt() {
+        let fixture = Fixture::new();
+        fixture.start();
+        fixture.prompt("Materialize this conversation");
+        fixture.end_and_capture();
+        fixture.rewrite_as_legacy_started_metadata();
+
+        let prepared = prepare_native_claude(
+            &fixture.store,
+            &fixture.paths,
+            &fixture.claude_config(),
+            &fixture.session,
+            &WorkspaceIdentity::discover(fixture.workspace.path()).unwrap(),
+        )
+        .unwrap();
+
+        assert!(prepared.resume, "prompted Claude launch must use --resume");
+        let metadata = fixture
+            .store
+            .provider_session(fixture.session.id, &ProviderKind::Claude)
+            .unwrap()
+            .unwrap()
+            .metadata;
+        assert_eq!(metadata[CLAUDE_MATERIALIZED_KEY], true);
+        assert!(metadata.get(CLAUDE_LEGACY_STARTED_KEY).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonempty_exit_transcript_materializes_and_backfills_legacy_metadata() {
+        let fixture = Fixture::new();
+        fixture.start();
+        let transcript = fixture.end_with_nonempty_transcript_and_capture();
+        assert!(transcript.exists());
+        let current = fixture
+            .store
+            .provider_session(fixture.session.id, &ProviderKind::Claude)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.metadata[CLAUDE_MATERIALIZED_KEY], true);
+        assert_eq!(
+            current.metadata["native_materialized_by"],
+            "nonempty_transcript_path"
+        );
+
+        // Simulate a database written by the prior release: SessionEnd raw
+        // exists, but only the incorrect SessionStart marker was retained.
+        fixture.rewrite_as_legacy_started_metadata();
+        let prepared = prepare_native_claude(
+            &fixture.store,
+            &fixture.paths,
+            &fixture.claude_config(),
+            &fixture.session,
+            &WorkspaceIdentity::discover(fixture.workspace.path()).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            prepared.resume,
+            "non-empty /exit transcript must use --resume"
+        );
+        let migrated = fixture
+            .store
+            .provider_session(fixture.session.id, &ProviderKind::Claude)
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.metadata[CLAUDE_MATERIALIZED_KEY], true);
+        assert_eq!(
+            migrated.metadata["native_materialized_by"],
+            "canonical_session_end_transcript"
+        );
+        assert!(migrated.metadata.get(CLAUDE_LEGACY_STARTED_KEY).is_none());
+    }
+
+    #[test]
+    fn terminal_crash_turn_does_not_block_a_fresh_prompt_when_claude_returns() {
+        let fixture = Fixture::new();
+        fixture.start();
+        let crashed = fixture.prompt("Start work before the crash");
+        let crashed_turn = crashed.turn_id.unwrap();
+        fixture
+            .store
+            .update_turn_state(
+                crashed_turn,
+                TurnStatus::Failed,
+                SideEffectState::Possible,
+                Some("crashed-native-turn"),
+                Utc::now(),
+            )
+            .unwrap();
+        fixture
+            .store
+            .update_native_launch(
+                fixture.launch_id,
+                NativeLaunchState::Failed,
+                Some(1),
+                Some("cross-provider continuation committed"),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let returned_launch = Uuid::now_v7();
+        let now = Utc::now();
+        let identity = WorkspaceIdentity::discover(fixture.workspace.path()).unwrap();
+        fixture
+            .store
+            .start_native_launch(&NativeLaunchRecord {
+                id: returned_launch,
+                session_id: fixture.session.id,
+                provider: ProviderKind::Claude,
+                native_session_id: fixture.native_session_id.clone(),
+                workspace_lease_key: identity.lease_key,
+                child_pid: None,
+                state: NativeLaunchState::Started,
+                exit_code: None,
+                error: None,
+                metadata: json!({}),
+                started_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let start_raw = fixture.raw(
+            "SessionStart",
+            json!({"source": "resume", "model": "claude-test"}),
+        );
+        let start = parse_hook_payload(&serde_json::to_vec(&start_raw).unwrap()).unwrap();
+        persist_hook_event(
+            &fixture.store,
+            &fixture.guard,
+            &fixture.session,
+            &fixture.native_session_id,
+            returned_launch,
+            &start,
+            &start_raw,
+        )
+        .unwrap();
+        let prompt_raw = fixture.raw(
+            "UserPromptSubmit",
+            json!({
+                "prompt": "Continue from the preserved workspace",
+                "prompt_id": Uuid::new_v4().to_string(),
+            }),
+        );
+        let prompt = parse_hook_payload(&serde_json::to_vec(&prompt_raw).unwrap()).unwrap();
+
+        let accepted = persist_hook_event(
+            &fixture.store,
+            &fixture.guard,
+            &fixture.session,
+            &fixture.native_session_id,
+            returned_launch,
+            &prompt,
+            &prompt_raw,
+        )
+        .unwrap();
+
+        assert_ne!(accepted.turn_id, Some(crashed_turn));
+        assert_eq!(
+            active_claude_turn(&fixture.store, fixture.session.id)
+                .unwrap()
+                .map(|turn| turn.id),
+            accepted.turn_id
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attached_claude_session_always_uses_resume() {
+        let fixture = Fixture::new();
+        crate::operations::persist_native_attachment(
+            &fixture.store,
+            &fixture.session,
+            &NativeSession {
+                id: ProviderSessionId::new(),
+                provider: ProviderKind::Claude,
+                native_session_id: fixture.native_session_id.clone(),
+                native_version: Some("2.1.139".to_owned()),
+                capabilities: BTreeMap::new(),
+            },
+            false,
+        )
+        .unwrap();
+
+        let prepared = prepare_native_claude(
+            &fixture.store,
+            &fixture.paths,
+            &fixture.claude_config(),
+            &fixture.session,
+            &WorkspaceIdentity::discover(fixture.workspace.path()).unwrap(),
+        )
+        .unwrap();
+
+        assert!(prepared.resume, "attached Claude session must use --resume");
     }
 
     #[test]
@@ -2877,16 +3473,16 @@ mod tests {
         let encoded = settings.to_string();
         assert!(encoded.contains(&prepared.launch_id.to_string()));
         assert!(!encoded.contains("Codex result"));
-        let delivering = fixture
-            .store
-            .begin_native_handoff_delivery(prepared.launch_id)
-            .unwrap();
-        assert!(session_start_additional_context(&delivering.capsule).is_ok());
+        let output = user_prompt_submit_additional_context(&staged.capsule).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
         let cursor = fixture
             .store
-            .complete_native_handoff_delivery(prepared.launch_id, Utc::now())
+            .provider_session(fixture.session.id, &ProviderKind::Claude)
             .unwrap();
-        assert_eq!(cursor, delivering.through_seq);
+        assert_eq!(cursor.unwrap().last_synced_seq, 0);
         assert_eq!(
             fixture
                 .store
@@ -2894,7 +3490,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            NativeHandoffState::Delivered
+            NativeHandoffState::Staged
         );
         #[cfg(unix)]
         {
@@ -2908,6 +3504,170 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn staged_handoff_survives_empty_exit_and_delivers_once_on_first_prompt() {
+        let fixture = Fixture::new();
+        fixture.start();
+        fixture.end_and_capture();
+        let cursor_before = fixture
+            .store
+            .provider_session(fixture.session.id, &ProviderKind::Claude)
+            .unwrap()
+            .unwrap()
+            .last_synced_seq;
+        fixture.append_codex_result("Codex delta that must survive an idle Claude launch");
+        let identity = WorkspaceIdentity::discover(fixture.workspace.path()).unwrap();
+        let config = fixture.claude_config();
+
+        let first = prepare_native_claude(
+            &fixture.store,
+            &fixture.paths,
+            &config,
+            &fixture.session,
+            &identity,
+        )
+        .unwrap();
+        fixture
+            .persist_for_launch(
+                first.launch_id,
+                &fixture.raw(
+                    "SessionStart",
+                    json!({"source": "startup", "model": "claude-test"}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .native_handoff(first.launch_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            NativeHandoffState::Staged
+        );
+        fixture
+            .persist_for_launch(
+                first.launch_id,
+                &fixture.raw("SessionEnd", json!({"reason": "prompt_input_exit"})),
+            )
+            .unwrap();
+        assert!(record_native_child_exit(&fixture.store, first.launch_id, Some(0)).unwrap());
+        assert_eq!(
+            fixture
+                .store
+                .provider_session(fixture.session.id, &ProviderKind::Claude)
+                .unwrap()
+                .unwrap()
+                .last_synced_seq,
+            cursor_before,
+            "idle exit must not advance past an undelivered handoff"
+        );
+
+        let second = prepare_native_claude(
+            &fixture.store,
+            &fixture.paths,
+            &config,
+            &fixture.session,
+            &identity,
+        )
+        .unwrap();
+        let restaged = fixture
+            .store
+            .native_handoff(second.launch_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restaged.state, NativeHandoffState::Staged);
+        assert!(restaged.capsule.contains("Codex delta that must survive"));
+        fixture
+            .persist_for_launch(
+                second.launch_id,
+                &fixture.raw(
+                    "SessionStart",
+                    json!({"source": "startup", "model": "claude-test"}),
+                ),
+            )
+            .unwrap();
+        fixture
+            .persist_for_launch(
+                second.launch_id,
+                &fixture.raw(
+                    "UserPromptSubmit",
+                    json!({
+                        "prompt": "Continue with the transferred context",
+                        "prompt_id": Uuid::new_v4().to_string(),
+                    }),
+                ),
+            )
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        assert_eq!(
+            deliver_staged_handoff(
+                &fixture.store,
+                fixture.session.id,
+                &fixture.native_session_id,
+                second.launch_id,
+                &mut stdout,
+            )
+            .unwrap(),
+            HandoffDelivery::Delivered
+        );
+        let output: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert!(
+            output["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("Codex delta that must survive")
+        );
+        assert_eq!(
+            fixture
+                .store
+                .native_handoff(second.launch_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            NativeHandoffState::Delivered
+        );
+        assert!(
+            fixture
+                .store
+                .provider_session(fixture.session.id, &ProviderKind::Claude)
+                .unwrap()
+                .unwrap()
+                .last_synced_seq
+                >= restaged.through_seq
+        );
+        assert_eq!(
+            fixture
+                .store
+                .provider_session(fixture.session.id, &ProviderKind::Claude)
+                .unwrap()
+                .unwrap()
+                .metadata[CLAUDE_MATERIALIZED_KEY],
+            true
+        );
+
+        let output_len = stdout.len();
+        assert_eq!(
+            deliver_staged_handoff(
+                &fixture.store,
+                fixture.session.id,
+                &fixture.native_session_id,
+                second.launch_id,
+                &mut stdout,
+            )
+            .unwrap(),
+            HandoffDelivery::None
+        );
+        assert_eq!(stdout.len(), output_len, "delivery must be idempotent");
     }
 
     #[test]

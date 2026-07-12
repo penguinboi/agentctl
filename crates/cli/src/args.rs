@@ -23,9 +23,9 @@ pub enum Command {
     Open(OpenArgs),
     /// Synchronize the canonical delta and switch to another native interactive CLI.
     Switch(SwitchArgs),
-    /// Create a new canonical session.
+    /// Create a canonical session and open the selected native CLI unless --no-launch.
     New(NewArgs),
-    /// Resume a canonical session.
+    /// Reopen a canonical session in its native CLI.
     Resume(ResumeArgs),
     /// List canonical sessions.
     List,
@@ -43,8 +43,8 @@ pub enum Command {
     Import(ImportArgs),
     /// Attach an existing provider-native session without importing its transcript.
     Attach(AttachArgs),
-    /// Import an existing native transcript through the provider's official history API.
-    ImportNative(AttachArgs),
+    /// Import an existing Codex transcript through its official history API.
+    ImportNative(ImportNativeArgs),
     /// Delete a local canonical session.
     Delete(SessionArg),
     /// Repair permissions, indexes, blobs, receipts, and projections.
@@ -102,6 +102,10 @@ pub struct NewArgs {
     /// Create the canonical session without opening a native provider CLI.
     #[arg(long)]
     pub no_launch: bool,
+    /// Allowlisted native CLI options for the initial native launch. Positional
+    /// prompts are rejected. Cannot be combined with `--no-launch`.
+    #[arg(last = true, allow_hyphen_values = true, conflicts_with = "no_launch")]
+    pub native_args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
@@ -191,6 +195,26 @@ pub struct AttachArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ImportNativeArgs {
+    /// Provider whose official history API will be used. Only Codex currently exposes one.
+    #[arg(value_enum)]
+    pub provider: ImportNativeProviderChoice,
+    /// Existing Codex thread id.
+    pub native_session_id: String,
+    /// Canonical session UUID or unique name. Defaults to the current workspace session.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Make Codex the active manual provider.
+    #[arg(long)]
+    pub activate: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ImportNativeProviderChoice {
+    Codex,
+}
+
+#[derive(Debug, Args)]
 pub struct RepairArgs {
     #[arg(long)]
     pub rebuild_projections: bool,
@@ -269,4 +293,57 @@ pub enum PluginCommand {
     Install { manifest: PathBuf },
     Remove { name: String },
     Doctor { name: Option<String> },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use clap::error::ErrorKind;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn new_forwards_native_options_to_its_initial_native_cli() {
+        let cli = Cli::try_parse_from([
+            "agentctl",
+            "new",
+            "--name",
+            "native",
+            "--provider",
+            "claude",
+            "--",
+            "--model",
+            "sonnet",
+        ])
+        .unwrap();
+        let Some(Command::New(args)) = cli.command else {
+            panic!("expected new command");
+        };
+        assert_eq!(
+            args.native_args,
+            [
+                std::ffi::OsString::from("--model"),
+                std::ffi::OsString::from("sonnet")
+            ]
+        );
+    }
+
+    #[test]
+    fn new_rejects_native_options_when_no_native_cli_will_launch() {
+        let error =
+            Cli::try_parse_from(["agentctl", "new", "--no-launch", "--", "--model", "sonnet"])
+                .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn native_history_import_is_codex_only_at_the_cli_boundary() {
+        let error =
+            Cli::try_parse_from(["agentctl", "import-native", "claude", "session-id"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+
+        let parsed =
+            Cli::try_parse_from(["agentctl", "import-native", "codex", "thread-id"]).unwrap();
+        assert!(matches!(parsed.command, Some(Command::ImportNative(_))));
+    }
 }

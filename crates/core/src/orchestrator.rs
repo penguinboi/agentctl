@@ -72,5 +72,10 @@ mod tests {
             state.failover_strategy(),
             FailoverStrategy::ContinueFromWorkspace
         );
+        state.observe_side_effect(SideEffectState::Confirmed);
+        assert_eq!(
+            state.failover_strategy(),
+            FailoverStrategy::ContinueFromWorkspace
+        );
     }
 }

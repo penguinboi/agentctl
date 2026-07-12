@@ -41,17 +41,22 @@ Codex CLI in the same worktree. To return to Claude Code, exit Codex and run:
 agentctl switch claude --session auth-race
 ```
 
-There is no live provider swap inside an active native process. A switch occurs
-at a clean process boundary so `agentctl` can capture the completed native
-delta before the other provider starts.
+There is no live provider swap inside an active native process. An ordinary
+switch occurs at a clean process boundary so `agentctl` can capture the
+completed native delta before the other provider starts. If a native process
+crashes mid-turn, a switch is allowed only after its journaled process group is
+proven dead, the provider delta and post-crash workspace snapshot are
+preserved, and a deterministic continuation capsule is committed.
 
 Automatic failover obeys the same boundary. When the launch provider was
-chosen implicitly, and only when no provider-specific arguments were
-forwarded, `agentctl` may open the other native CLI after the first native
-process has exited, its delta has been captured, and its recorded health
-requires a fallback. It never moves an in-flight turn, types or replays the
-user's prompt, or follows any explicit provider selection with another
-provider.
+chosen implicitly, and only when no native arguments were forwarded,
+`agentctl` may open the other native CLI after a clean captured exit
+whose recorded health requires fallback. After a recoverable crash it may also
+open the other native CLI with the durable continuation capsule, marked with
+`Possible` or `Confirmed` side effects. It never moves provider execution,
+types or replays the user's prompt, or follows an explicit provider selection
+with another provider. The user submits the continuation inside the newly
+opened native CLI.
 
 Useful launch forms:
 
@@ -65,12 +70,28 @@ agentctl new --name prepared --no-launch
 
 Arguments after `--` are forwarded only when they are recognized, bounded
 native options that do not replace the wrapper-owned session, workspace,
-settings, security boundary, or foreground lifecycle:
+settings overlay, capture hooks, or foreground lifecycle:
 
 ```bash
+agentctl new --name auth-race --provider claude -- --model sonnet
 agentctl open claude --session auth-race -- --model sonnet
 agentctl open codex --session auth-race -- --model gpt-5
 ```
+
+When the provider is implicit or `auto`, forwarded options must belong to the
+intersection of the Claude and Codex allowlists. Select `--provider` (or use an
+explicit provider argument on `open`/`switch`) for provider-specific flags such
+as Claude `--ax-screen-reader` or Codex `--no-alt-screen`.
+
+Explicitly forwarded native security options are still the user's decision.
+For example, Codex `--sandbox` / `--ask-for-approval` and Claude
+`--permission-mode` can make the native process less restrictive than its
+defaults. `agentctl` never adds those options itself and continues to reject
+the providers' all-in-one bypass flags.
+
+`new` forwards those options to its initial native launch too. Native options
+cannot be combined with `new --no-launch`, because no provider process exists
+to receive them.
 
 Positional arguments are always rejected because both provider CLIs interpret
 one as an initial conversational prompt. Enter prompts only after the native
@@ -137,9 +158,11 @@ turn.
 
 Claude Code does not expose a public equivalent for inserting an arbitrary
 external assistant message into an existing transcript. A Codex-to-Claude
-handoff is supplied as structured historical context at native session start.
-Claude receives the meaning of the prior work, but its native transcript is not
-a byte-for-byte copy of the Codex transcript.
+handoff is supplied as structured historical context by the first real
+`UserPromptSubmit` hook. Merely opening and exiting Claude does not consume the
+handoff or advance its projection cursor; the delta remains pending for the
+next prompt. Claude receives the meaning of the prior work, but its native
+transcript is not a byte-for-byte copy of the Codex transcript.
 
 `agentctl` promises one auditable canonical conversation and semantic
 continuity, not two identical provider-owned histories. It never edits either
@@ -218,10 +241,15 @@ agentctl delete auth-race
 lag, and workspace state. `metrics` reads only local canonical data; provider
 usage can be absent or incomplete when the native protocol does not report it.
 
-`sync` projects pending canonical context without opening a native chat. Normal
-switches already synchronize lazily, so explicit sync is mostly useful before
-going offline or for diagnostics. Never run state-changing maintenance while a
-mapped native CLI is still open.
+`sync` projects pending Codex context without opening a native chat. Claude's
+`shouldQuery:false` stream has no durable delivery receipt, so a sync-only
+process never advances Claude's cursor merely because it enqueued that frame.
+Its delta remains canonical and is journaled for delivery by the first real
+`UserPromptSubmit` of the next native Claude launch; the sync report marks that
+cursor as `next_native_user_prompt`. Normal switches already synchronize
+lazily, so explicit sync is mostly useful before going offline or for
+diagnostics. Never run state-changing maintenance while a mapped native CLI is
+still open.
 
 An `Exited` or `Uncertain` native launch is not silently discarded. After
 confirming that its recorded provider process is no longer alive, explicitly
@@ -299,8 +327,10 @@ Routing policies are `manual`, `claude-first`, `codex-first`, `balanced`, and
 `sticky-balanced`. Routing only selects which native CLI to open at a launch
 boundary; it does not send a prompt to either provider. A health-based fallback
 from an implicitly selected provider can open the other native CLI only after
-the first foreground process exits and capture completes. The user still writes
-the next request inside that native CLI.
+the first foreground process exits and capture completes. A mid-turn crash
+additionally requires a dead journaled PID, a durable post-crash snapshot,
+unambiguous handoff state, and a canonical non-replay continuation marker. The
+user still writes the next request inside that native CLI.
 
 The state directory contains the SQLite canonical event store, blobs, protocol
 capability evidence, workspace locks, and diagnostic logs. On Unix,

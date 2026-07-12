@@ -9,8 +9,9 @@ remain pre-1.0.
 
 1. Update `workspace.package.version` in `Cargo.toml` and `Cargo.lock`.
 2. Update `CHANGELOG.md` and compatibility notes.
-3. Run the complete CI suite, including MSRV, both supported host operating
-   systems, `cargo-deny`, and `cargo-audit`.
+3. Run the complete CI suite, including an explicit Rust 1.88.0 MSRV check,
+   workspace tests on Linux, macOS, and Windows, `cargo-deny`, and
+   `cargo-audit`.
 4. Create and push the exact tag `v<workspace-version>`.
 5. Verify the GitHub Release contains four archives (Linux x86_64, macOS
    x86_64/arm64, and Windows x86_64) and their SHA-256 files.

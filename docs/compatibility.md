@@ -25,10 +25,13 @@ unknown. Missing safe context delivery, native identity validation, or capture
 must fail closed; it must never be replaced by an unrecorded prompt prefix or a
 fabricated projection receipt.
 
-Codex schemas are cached under the state directory by installed version. Claude
-hook and resume behavior is capability-gated rather than inferred from help
-text alone. Neither provider's private transcript files are a compatibility
-surface.
+Codex schemas are generated lazily and cached under the selected agentctl state
+root at `protocols/codex/<normalized-installed-version>`. `--home` and
+`AGENTCTL_HOME` therefore isolate both runtime and doctor protocol state; both
+paths use the same version normalization, interprocess lock, validation, and
+atomic publication. Running doctor first is not required. Claude hook and
+resume behavior is capability-gated rather than inferred from help text alone.
+Neither provider's private transcript files are a compatibility surface.
 
 After upgrading `claude` or `codex`:
 

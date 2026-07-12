@@ -387,6 +387,21 @@ pub fn parse_hook_payload_for_session(
 
 /// Builds the structured stdout expected from a `SessionStart` command hook.
 pub fn session_start_additional_context(context: &str) -> Result<Value, NativeHookError> {
+    additional_context_for_event("SessionStart", context)
+}
+
+/// Builds the structured stdout expected from a `UserPromptSubmit` command
+/// hook. This is the safe handoff boundary: Claude adds the context to the
+/// prompt that is about to query the model, while an idle native launch does
+/// not consume it.
+pub fn user_prompt_submit_additional_context(context: &str) -> Result<Value, NativeHookError> {
+    additional_context_for_event("UserPromptSubmit", context)
+}
+
+fn additional_context_for_event(
+    hook_event_name: &'static str,
+    context: &str,
+) -> Result<Value, NativeHookError> {
     validate_bounded_string(context, "additionalContext", MAX_TEXT_BYTES, false)
         .map_err(NativeHookError::InvalidOutput)?;
     let char_count = context.chars().count();
@@ -397,7 +412,7 @@ pub fn session_start_additional_context(context: &str) -> Result<Value, NativeHo
     }
     Ok(json!({
         "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
+            "hookEventName": hook_event_name,
             "additionalContext": context,
         }
     }))
@@ -781,7 +796,7 @@ mod tests {
         PermissionMode, SessionEndReason, SessionStartSource, StopFailureKind,
         merge_interactive_hook_settings, merge_interactive_hook_settings_json, parse_hook_payload,
         parse_hook_payload_for_session, session_start_additional_context,
-        session_start_additional_context_json,
+        session_start_additional_context_json, user_prompt_submit_additional_context,
     };
 
     fn common(event: &str) -> Value {
@@ -1096,6 +1111,23 @@ mod tests {
         ));
         assert!(matches!(
             session_start_additional_context(&"x".repeat(10_001)),
+            Err(NativeHookError::InvalidOutput(_))
+        ));
+    }
+
+    #[test]
+    fn builds_user_prompt_submit_additional_context_output() {
+        let value = user_prompt_submit_additional_context("handoff from Codex").unwrap();
+        assert_eq!(
+            value["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert_eq!(
+            value["hookSpecificOutput"]["additionalContext"],
+            "handoff from Codex"
+        );
+        assert!(matches!(
+            user_prompt_submit_additional_context(""),
             Err(NativeHookError::InvalidOutput(_))
         ));
     }

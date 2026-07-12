@@ -22,6 +22,31 @@ async fn installed_app_server_handshake_and_account_probe() {
 }
 
 #[tokio::test]
+#[ignore = "requires a locally installed Codex CLI"]
+async fn installed_empty_thread_is_materialized_for_restart_resume_without_turn() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let unified_session_id = UnifiedSessionId::new();
+    let context = SessionContext {
+        unified_session_id,
+        workspace_root: workspace.path().to_path_buf(),
+        workspace_fingerprint: "empty-thread-live-probe".to_owned(),
+        auth_mode: AuthMode::NativeLocal,
+    };
+    let adapter = CodexAdapter::new("codex", None);
+    let session = adapter.ensure_session(&context).await.unwrap();
+    adapter.shutdown().await.unwrap();
+
+    let restarted = CodexAdapter::new("codex", None);
+    let restored = restarted.restore_session(&context, session).await.unwrap();
+    let transcript = restarted.read_native_history(&restored).await.unwrap();
+    assert!(
+        transcript.turns.is_empty(),
+        "materializing an empty thread must not create a user-authored native turn"
+    );
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "requires a locally installed and authenticated Codex CLI"]
 async fn installed_thread_injection_and_restart_resume() {
     let workspace = tempfile::TempDir::new().unwrap();

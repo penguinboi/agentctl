@@ -280,6 +280,41 @@ pub fn validate(provider: &ProviderKind, args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
+/// Validates forwarded arguments before any provider selection or durable
+/// state transition can occur.
+///
+/// When the provider was not selected explicitly, every argument must be safe
+/// for both native CLIs. Otherwise provider selection itself could turn an
+/// apparently valid invocation into a provider-specific prompt or option after
+/// health probing and routing have already mutated local state.
+pub fn preflight(provider: Option<&ProviderKind>, args: &[OsString]) -> Result<()> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    if let Some(provider) = provider {
+        return validate(provider, args);
+    }
+
+    let claude = validate(&ProviderKind::Claude, args);
+    let codex = validate(&ProviderKind::Codex, args);
+    match (claude, codex) {
+        (Ok(()), Ok(())) => Ok(()),
+        (claude, codex) => {
+            let detail = [
+                claude.err().map(|error| format!("Claude: {error}")),
+                codex.err().map(|error| format!("Codex: {error}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
+            bail!(
+                "native arguments with automatic provider selection must be valid for both Claude and Codex; select a provider explicitly ({detail})"
+            )
+        }
+    }
+}
+
 fn utf8_argument<'a>(provider: &ProviderKind, argument: &'a OsString) -> Result<&'a str> {
     argument.to_str().ok_or_else(|| {
         anyhow::anyhow!("native {provider} arguments must be valid UTF-8 for safe validation")
@@ -365,6 +400,37 @@ mod tests {
     fn empty_forwarding_is_valid() {
         validate(&ProviderKind::Claude, &[]).expect("empty Claude arguments");
         validate(&ProviderKind::Codex, &[]).expect("empty Codex arguments");
+        preflight(None, &[]).expect("empty automatic arguments");
+    }
+
+    #[test]
+    fn automatic_provider_preflight_accepts_only_the_allowlist_intersection() {
+        preflight(None, &strings(&["--model", "sonnet"]))
+            .expect("the shared model option is safe for either provider");
+
+        let claude_only = preflight(None, &strings(&["--ax-screen-reader"]))
+            .unwrap_err()
+            .to_string();
+        assert!(claude_only.contains("automatic provider selection"));
+        assert!(claude_only.contains("select a provider explicitly"));
+        assert!(claude_only.contains("Codex:"));
+
+        let codex_only = preflight(None, &strings(&["--no-alt-screen"]))
+            .unwrap_err()
+            .to_string();
+        assert!(codex_only.contains("automatic provider selection"));
+        assert!(codex_only.contains("Claude:"));
+    }
+
+    #[test]
+    fn explicit_provider_preflight_uses_only_that_provider_allowlist() {
+        preflight(
+            Some(&ProviderKind::Claude),
+            &strings(&["--ax-screen-reader"]),
+        )
+        .expect("explicit Claude option");
+        preflight(Some(&ProviderKind::Codex), &strings(&["--no-alt-screen"]))
+            .expect("explicit Codex option");
     }
 
     #[test]

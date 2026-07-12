@@ -62,6 +62,11 @@ impl AgentctlPaths {
         }
         Ok(())
     }
+
+    /// Root for installed-version Codex protocol schemas owned by this agentctl home.
+    pub fn codex_protocol_root(&self) -> PathBuf {
+        self.protocols.join("codex")
+    }
 }
 
 fn ensure_private_directory(path: &Path, recursive: bool) -> io::Result<()> {
@@ -187,6 +192,18 @@ fn set_private_file(_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_protocol_cache_is_scoped_to_the_resolved_home() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("isolated-agentctl-home");
+        let paths = AgentctlPaths::resolve(Some(home.clone())).unwrap();
+
+        assert_eq!(
+            paths.codex_protocol_root(),
+            home.join("protocols").join("codex")
+        );
+    }
 
     #[cfg(unix)]
     fn mode(path: &Path) -> u32 {

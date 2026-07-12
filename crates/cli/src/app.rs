@@ -47,6 +47,10 @@ const MAX_NATIVE_PROVIDER_ATTEMPTS: usize = 2;
 
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch(cli: Cli) -> Result<()> {
+    // Reject unsafe forwarding before resolving paths, opening/migrating the
+    // database, applying retention, creating a session, probing providers, or
+    // reconciling an earlier native launch.
+    preflight_native_command(cli.command.as_ref())?;
     let paths = AgentctlPaths::resolve(cli.home.clone())?;
     let _ = init_logging(&LoggingConfig::default());
     let cwd = std::env::current_dir()?;
@@ -114,8 +118,16 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             if args.no_launch {
                 print_value(&session, cli.json)
             } else {
-                run_native_session(store, paths, config, session, manual, Vec::new(), cli.json)
-                    .await
+                run_native_session(
+                    store,
+                    paths,
+                    config,
+                    session,
+                    manual,
+                    args.native_args,
+                    cli.json,
+                )
+                .await
             }
         }
         Some(Command::Resume(args)) => {
@@ -188,14 +200,13 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::ImportNative(args)) => {
             let session = operations::resolve_session(&store, args.session.as_deref(), &cwd)?;
             let config = Config::load(&paths, &session.workspace_path)?;
-            let provider = native_provider_choice(args.provider);
             print_value(
                 &import_native_session(
                     &paths,
                     &config,
                     &store,
                     &session,
-                    provider,
+                    ProviderKind::Codex,
                     &args.native_session_id,
                     args.activate,
                 )
@@ -379,6 +390,7 @@ fn create_session(
     Ok(session)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_native_session(
     store: AgentctlStore,
     paths: AgentctlPaths,
@@ -388,12 +400,17 @@ async fn run_native_session(
     native_args: Vec<std::ffi::OsString>,
     json: bool,
 ) -> Result<()> {
+    // This must remain the first operation in the shared native path. Callers
+    // preflight before their own mutations too, but this boundary prevents a
+    // future caller from acquiring a lease, reconciling a dead launch, probing
+    // health, or preparing a projection for invalid forwarded arguments.
+    crate::native_args::preflight(requested_provider.as_ref(), &native_args)?;
     let explicit_provider = requested_provider.is_some();
     let identity = WorkspaceIdentity::discover(&session.workspace_path)?;
     let _lease =
         WorkspaceLease::acquire_for_identity(&paths.locks, &identity, session.id, TurnId::new())
             .context("another native agentctl session already owns this worktree")?;
-    reconcile_open_native_launch(
+    let recovered = reconcile_open_native_launch(
         &store,
         &paths,
         &config,
@@ -404,6 +421,15 @@ async fn run_native_session(
     .await?;
     let mut session = session;
     let mut requested_provider = requested_provider;
+    if requested_provider.is_none()
+        && let Some(recovered) = &recovered
+        && !recovered.clean_exit
+        && recovered.continuation.is_none()
+    {
+        // An implicit reopen cannot silently change providers unless the
+        // crash was first converted into a durable continuation capsule.
+        requested_provider = Some(recovered.provider.clone());
+    }
     let mut reports = Vec::new();
     for attempt in 0..MAX_NATIVE_PROVIDER_ATTEMPTS {
         let provider =
@@ -413,7 +439,13 @@ async fn run_native_session(
             matches!(provider, ProviderKind::Claude | ProviderKind::Codex),
             "provider {provider} does not expose a supported native interactive CLI"
         );
-        let report = run_selected_native_provider(
+        // Validate at the shared provider-selection boundary, before either
+        // adapter can create a native session, project context, update
+        // routing, journal a launch, write hook settings, or capture a
+        // workspace snapshot. Provider launchers repeat the same validation as
+        // defense in depth, but must never be its first execution point.
+        crate::native_args::validate(&provider, &native_args)?;
+        let report = match run_selected_native_provider(
             &store,
             &paths,
             &config,
@@ -423,7 +455,79 @@ async fn run_native_session(
             &provider,
             explicit_provider,
         )
-        .await?;
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                if !native_failover_attempt_allowed(
+                    attempt,
+                    explicit_provider,
+                    !native_args.is_empty(),
+                ) {
+                    return Err(error);
+                }
+                let fallback = alternate_native_provider(&provider);
+                let recovery = match reconcile_open_native_launch(
+                    &store,
+                    &paths,
+                    &config,
+                    &session,
+                    &identity,
+                    Some(&fallback),
+                )
+                .await
+                {
+                    Ok(Some(recovery)) if recovery.continuation.is_some() => recovery,
+                    Ok(Some(_)) => {
+                        return Err(error.context(
+                            "native process failed, but no durable cross-provider continuation was created",
+                        ));
+                    }
+                    Ok(None) => {
+                        return Err(error.context(
+                            "native process failed before a recoverable launch was journaled",
+                        ));
+                    }
+                    Err(recovery) => {
+                        return Err(error.context(format!(
+                            "safe native failover reconciliation was refused: {recovery:#}"
+                        )));
+                    }
+                };
+                let health = probe_native_candidate(&paths, &config, &store, &session, &fallback)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "{provider} crash was preserved as a continuation, but {fallback} is unavailable"
+                        )
+                    })?;
+                ensure!(
+                    health.status.available(),
+                    "{} crash was preserved as a continuation, but {fallback} is {:?}",
+                    provider,
+                    health.status
+                );
+                let continuation = recovery.continuation.as_ref().expect("checked above");
+                eprintln!(
+                    "agentctl: {provider} ended unexpectedly after {:?} side effects; opening native {fallback} for continuation (no prompt was replayed)",
+                    continuation.side_effect_state
+                );
+                reports.push(serde_json::json!({
+                    "provider": provider,
+                    "native_crash": true,
+                    "recovered_launch_id": recovery.launch_id,
+                    "continuation_event_id": continuation.event_id,
+                    "side_effect_state": continuation.side_effect_state,
+                    "fallback_provider": fallback,
+                    "prompt_replayed": false,
+                }));
+                session = store
+                    .get_session(session.id)?
+                    .context("canonical session disappeared before native crash failover")?;
+                requested_provider = Some(fallback);
+                continue;
+            }
+        };
         let exit_code = native_report_exit_code(&report);
         let failover =
             native_failover_attempt_allowed(attempt, explicit_provider, !native_args.is_empty())
@@ -452,6 +556,56 @@ async fn run_native_session(
         return Ok(());
     }
     unreachable!("native failover loop is bounded to two attempts")
+}
+
+fn preflight_native_command(command: Option<&Command>) -> Result<()> {
+    match command {
+        Some(Command::Open(args)) => crate::native_args::preflight(
+            args.provider.map(native_provider_choice).as_ref(),
+            &args.native_args,
+        ),
+        Some(Command::Switch(args)) => crate::native_args::preflight(
+            Some(&native_provider_choice(args.provider)),
+            &args.native_args,
+        ),
+        Some(Command::New(args)) => crate::native_args::preflight(
+            provider_choice(args.provider).as_ref(),
+            &args.native_args,
+        ),
+        Some(Command::Resume(args)) => crate::native_args::preflight(
+            args.provider.map(native_provider_choice).as_ref(),
+            &args.native_args,
+        ),
+        None
+        | Some(
+            Command::List
+            | Command::Status(_)
+            | Command::Metrics(_)
+            | Command::Doctor(_)
+            | Command::History(_)
+            | Command::Export(_)
+            | Command::Import(_)
+            | Command::Attach(_)
+            | Command::ImportNative(_)
+            | Command::Delete(_)
+            | Command::Repair(_)
+            | Command::Compact(_)
+            | Command::Sync(_)
+            | Command::Fork(_)
+            | Command::Provider(_)
+            | Command::Workspace(_)
+            | Command::Plugin(_)
+            | Command::Hook(_),
+        ) => Ok(()),
+    }
+}
+
+fn alternate_native_provider(provider: &ProviderKind) -> ProviderKind {
+    match provider {
+        ProviderKind::Claude => ProviderKind::Codex,
+        ProviderKind::Codex => ProviderKind::Claude,
+        ProviderKind::Plugin(_) => unreachable!("plugins do not expose a native CLI"),
+    }
 }
 
 fn native_failover_attempt_allowed(
@@ -624,6 +778,14 @@ fn native_report_exit_code(report: &serde_json::Value) -> Option<i32> {
         .or(Some(1))
 }
 
+#[derive(Clone, Debug)]
+struct ReconciledNativeLaunch {
+    launch_id: uuid::Uuid,
+    provider: ProviderKind,
+    clean_exit: bool,
+    continuation: Option<operations::NativeFailoverContinuation>,
+}
+
 async fn reconcile_open_native_launch(
     store: &AgentctlStore,
     paths: &AgentctlPaths,
@@ -631,9 +793,9 @@ async fn reconcile_open_native_launch(
     session: &UnifiedSession,
     identity: &WorkspaceIdentity,
     requested_provider: Option<&ProviderKind>,
-) -> Result<()> {
+) -> Result<Option<ReconciledNativeLaunch>> {
     let Some(launch) = store.open_native_launch_for_workspace(&identity.lease_key)? else {
-        return Ok(());
+        return Ok(None);
     };
     let pid = journaled_native_pid(&launch)?;
     let running = native::native_process_is_running(pid).with_context(|| {
@@ -654,15 +816,50 @@ async fn reconcile_open_native_launch(
         "worktree has an unfinished native launch owned by canonical session {}; resume that session first",
         launch.session_id
     );
-    match &launch.provider {
+    ensure_post_crash_workspace_snapshot(store, config, session, identity, &launch)?;
+    let recovery = match &launch.provider {
         ProviderKind::Codex => {
-            reconcile_codex_launch(store, paths, config, session, identity, &launch).await
+            reconcile_codex_launch(
+                store,
+                paths,
+                config,
+                session,
+                identity,
+                requested_provider,
+                &launch,
+            )
+            .await?
         }
         ProviderKind::Claude => {
-            reconcile_claude_launch(store, session, requested_provider, &launch)
+            reconcile_claude_launch(store, config, session, requested_provider, &launch)?
         }
         ProviderKind::Plugin(_) => bail!("plugins cannot own provider-native interactive launches"),
+    };
+    Ok(Some(recovery))
+}
+
+fn ensure_post_crash_workspace_snapshot(
+    store: &AgentctlStore,
+    config: &Config,
+    session: &UnifiedSession,
+    identity: &WorkspaceIdentity,
+    launch: &NativeLaunchRecord,
+) -> Result<()> {
+    let snapshots = operations::native_launch_workspace_snapshots(store, session, launch)?;
+    if snapshots.after.is_some() {
+        return Ok(());
     }
+    let after = capture_git_snapshot(identity.execution_root())
+        .context("failed to capture workspace state while reconciling dead native process")?;
+    persist_workspace_snapshot(
+        store,
+        config,
+        session,
+        &launch.provider,
+        "after_native_recovery",
+        &after,
+        Some(&snapshots.before),
+    )
 }
 
 fn journaled_native_pid(launch: &NativeLaunchRecord) -> Result<u32> {
@@ -680,8 +877,9 @@ async fn reconcile_codex_launch(
     config: &Config,
     session: &UnifiedSession,
     identity: &WorkspaceIdentity,
+    requested_provider: Option<&ProviderKind>,
     launch: &NativeLaunchRecord,
-) -> Result<()> {
+) -> Result<ReconciledNativeLaunch> {
     let provider = store
         .provider_session(session.id, &ProviderKind::Codex)?
         .context("unfinished Codex launch has no provider-session binding")?;
@@ -704,7 +902,7 @@ async fn reconcile_codex_launch(
             .context("unfinished Codex launch has no thread/list baseline")?,
     )
     .context("unfinished Codex launch has an invalid thread/list baseline")?;
-    let current = snapshot_codex_threads(config, identity).await?;
+    let current = snapshot_codex_threads(paths, config, identity).await?;
     if let Err(error) =
         validate_codex_thread_continuity(&baseline, &current, &launch.native_session_id)
     {
@@ -714,6 +912,18 @@ async fn reconcile_codex_launch(
     capture_codex_native_history(store, paths, config, session, identity, &native_session)
         .await
         .context("failed to reconcile the unfinished native Codex transcript")?;
+    let switching_provider =
+        requested_provider.is_some_and(|provider| provider != &launch.provider);
+    let continuation = switching_provider
+        .then(|| {
+            operations::persist_native_failover_continuation(
+                store,
+                &config.payload_guard()?,
+                session,
+                launch,
+            )
+        })
+        .transpose()?;
     store.update_native_launch(
         launch.id,
         NativeLaunchState::Captured,
@@ -721,7 +931,12 @@ async fn reconcile_codex_launch(
         None,
         Utc::now(),
     )?;
-    Ok(())
+    Ok(ReconciledNativeLaunch {
+        launch_id: launch.id,
+        provider: launch.provider.clone(),
+        clean_exit: false,
+        continuation,
+    })
 }
 
 fn mark_codex_launch_uncertain(
@@ -746,12 +961,13 @@ fn mark_codex_launch_uncertain(
 
 fn reconcile_claude_launch(
     store: &AgentctlStore,
+    config: &Config,
     session: &UnifiedSession,
     requested_provider: Option<&ProviderKind>,
     launch: &NativeLaunchRecord,
-) -> Result<()> {
+) -> Result<ReconciledNativeLaunch> {
     if launch.state == NativeLaunchState::CaptureReady {
-        return store
+        store
             .update_native_launch(
                 launch.id,
                 NativeLaunchState::Captured,
@@ -759,30 +975,57 @@ fn reconcile_claude_launch(
                 None,
                 Utc::now(),
             )
-            .map_err(Into::into);
+            .map_err(anyhow::Error::from)?;
+        return Ok(ReconciledNativeLaunch {
+            launch_id: launch.id,
+            provider: launch.provider.clone(),
+            clean_exit: true,
+            continuation: None,
+        });
     }
+    let switching_provider =
+        requested_provider.is_some_and(|provider| provider != &launch.provider);
     let reopening_same_provider = requested_provider == Some(&ProviderKind::Claude)
         || (requested_provider.is_none()
             && session.active_provider.as_ref() == Some(&ProviderKind::Claude));
     ensure!(
-        reopening_same_provider,
-        "the previous Claude launch ended without a confirmed SessionEnd hook; reopen the same Claude session before switching providers"
+        reopening_same_provider || switching_provider,
+        "the previous Claude launch ended without a confirmed SessionEnd hook; explicitly reopen Claude or switch to Codex through a durable continuation"
     );
     ensure!(
         launch.child_pid.is_some(),
         "the previous Claude wrapper crashed before its child PID was journaled; process ownership is uncertain and cannot be resumed automatically"
     );
     ensure_claude_handoff_is_replay_safe(store, launch)?;
-    mark_crashed_claude_turns_uncertain(store, session)?;
-    mark_claude_session_started(store, session)?;
+    operations::terminalize_native_crash_turns(store, &config.payload_guard()?, session, launch)?;
+    crate::native_hooks::reconcile_claude_materialization(store, session.id)?;
+    let continuation = switching_provider
+        .then(|| {
+            operations::persist_native_failover_continuation(
+                store,
+                &config.payload_guard()?,
+                session,
+                launch,
+            )
+        })
+        .transpose()?;
     store.update_native_launch(
         launch.id,
         NativeLaunchState::Failed,
         launch.exit_code,
-        Some("superseded by a same-provider crash-resume launch"),
+        Some(if switching_provider {
+            "superseded by a cross-provider native continuation"
+        } else {
+            "superseded by a same-provider crash-resume launch"
+        }),
         Utc::now(),
     )?;
-    Ok(())
+    Ok(ReconciledNativeLaunch {
+        launch_id: launch.id,
+        provider: launch.provider.clone(),
+        clean_exit: false,
+        continuation,
+    })
 }
 
 fn ensure_claude_handoff_is_replay_safe(
@@ -798,38 +1041,6 @@ fn ensure_claude_handoff_is_replay_safe(
             ),
             "the previous Claude handoff may already have been delivered; refusing to duplicate historical context"
         );
-    }
-    Ok(())
-}
-
-fn mark_crashed_claude_turns_uncertain(
-    store: &AgentctlStore,
-    session: &UnifiedSession,
-) -> Result<()> {
-    for turn in store
-        .recovery_candidates()?
-        .into_iter()
-        .filter(|turn| turn.session_id == session.id && turn.provider == Some(ProviderKind::Claude))
-    {
-        store.update_turn_state(
-            turn.id,
-            agentctl_core::TurnStatus::Uncertain,
-            turn.side_effect_state
-                .observe(agentctl_core::SideEffectState::Possible),
-            turn.native_turn_id.as_deref(),
-            Utc::now(),
-        )?;
-    }
-    Ok(())
-}
-
-fn mark_claude_session_started(store: &AgentctlStore, session: &UnifiedSession) -> Result<()> {
-    if let Some(mut provider) = store.provider_session(session.id, &ProviderKind::Claude)? {
-        if let Some(metadata) = provider.metadata.as_object_mut() {
-            metadata.insert("native_started".to_owned(), serde_json::Value::Bool(true));
-        }
-        provider.updated_at = Utc::now();
-        store.upsert_provider_session(&provider)?;
     }
     Ok(())
 }
@@ -1057,7 +1268,7 @@ async fn run_native_codex(
         .prepare_native_projection(&ProviderKind::Codex)
         .await;
     let native_session = finish_runtime(&runtime, None, prepared).await?;
-    let thread_baseline = snapshot_codex_threads(config, identity).await?;
+    let thread_baseline = snapshot_codex_threads(paths, config, identity).await?;
     store.update_session_routing(
         session.id,
         Some(&ProviderKind::Codex),
@@ -1081,7 +1292,7 @@ async fn run_native_codex(
     )
     .await?;
     let finalized = async {
-        let thread_after = snapshot_codex_threads(config, identity).await?;
+        let thread_after = snapshot_codex_threads(paths, config, identity).await?;
         validate_codex_thread_continuity(
             &thread_baseline,
             &thread_after,
@@ -1239,10 +1450,14 @@ fn mark_native_launch_after_error(
 }
 
 async fn snapshot_codex_threads(
+    paths: &AgentctlPaths,
     config: &Config,
     identity: &WorkspaceIdentity,
 ) -> Result<InteractiveThreadSnapshot> {
-    let adapter = CodexAdapter::new(&config.providers.codex_binary, None);
+    let adapter = CodexAdapter::new(
+        &config.providers.codex_binary,
+        Some(paths.codex_protocol_root()),
+    );
     let snapshot = adapter
         .snapshot_interactive_threads(identity.execution_root())
         .await;
@@ -1414,7 +1629,7 @@ async fn load_native_provider(
     match kind {
         ProviderKind::Codex => Ok(Arc::new(CodexAdapter::new(
             &config.providers.codex_binary,
-            None,
+            Some(paths.codex_protocol_root()),
         ))),
         ProviderKind::Claude => Ok(Arc::new(ClaudeAdapter::from_config(ClaudeConfig {
             binary: PathBuf::from(&config.providers.claude_binary),
@@ -1588,7 +1803,10 @@ async fn run_doctor(
             .checks
             .retain(|check| check.name != "live protocol turns");
         let temporary = tempfile::tempdir()?;
-        let codex = CodexAdapter::new(&config.providers.codex_binary, None);
+        let codex = CodexAdapter::new(
+            &config.providers.codex_binary,
+            Some(paths.codex_protocol_root()),
+        );
         let claude = ClaudeAdapter::from_config(ClaudeConfig {
             binary: PathBuf::from(&config.providers.claude_binary),
             runtime_root: Some(paths.home.join("runtime/doctor-claude")),
@@ -1950,7 +2168,11 @@ fn set_private_file(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod routing_tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, ffi::OsString, process::Command as StdCommand};
+
+    use agentctl_core::{ProviderSessionId, ProviderStatus};
+    use agentctl_storage::{ProviderSessionRecord, TurnRecord};
+    use clap::Parser;
 
     use super::*;
 
@@ -2212,6 +2434,542 @@ mod routing_tests {
         assert!(!native_failover_attempt_allowed(0, false, true));
     }
 
+    #[tokio::test]
+    async fn invalid_new_native_args_fail_before_home_or_session_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        for provider in ["claude", "codex"] {
+            let home = directory.path().join(format!("home-{provider}"));
+            let cli = Cli::try_parse_from(vec![
+                OsString::from("agentctl"),
+                OsString::from("--home"),
+                home.clone().into_os_string(),
+                OsString::from("new"),
+                OsString::from("--workspace"),
+                workspace.clone().into_os_string(),
+                OsString::from("--provider"),
+                OsString::from(provider),
+                OsString::from("--"),
+                OsString::from("--not-an-agentctl-safe-option"),
+            ])
+            .unwrap();
+
+            let error = dispatch(cli).await.unwrap_err().to_string();
+
+            assert!(error.contains("safe forwarding allowlist"));
+            assert!(
+                !home.exists(),
+                "invalid new {provider} arguments must not even initialize agentctl state"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_provider_specific_args_fail_before_any_state_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        for (name, option) in [
+            ("claude-only", "--ax-screen-reader"),
+            ("codex-only", "--no-alt-screen"),
+        ] {
+            let home = directory.path().join(format!("home-{name}"));
+            let cli = Cli::try_parse_from(vec![
+                OsString::from("agentctl"),
+                OsString::from("--home"),
+                home.clone().into_os_string(),
+                OsString::from("new"),
+                OsString::from("--workspace"),
+                workspace.clone().into_os_string(),
+                OsString::from("--"),
+                OsString::from(option),
+            ])
+            .unwrap();
+
+            let error = dispatch(cli).await.unwrap_err().to_string();
+
+            assert!(error.contains("automatic provider selection"));
+            assert!(error.contains("select a provider explicitly"));
+            assert!(
+                !home.exists(),
+                "provider-specific automatic arguments must fail before opening local state"
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_invalid_native_args_do_not_prepare_provider(provider: ProviderKind) {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AgentctlPaths::resolve(Some(directory.path().join("home"))).unwrap();
+        let store = operations::open_store(&paths).unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut config = Config::default();
+        config.providers.claude_binary = "binary-must-not-run".to_owned();
+        config.providers.codex_binary = "binary-must-not-run".to_owned();
+        let session = create_session(
+            &store,
+            &config,
+            &workspace,
+            Some("invalid-native-args"),
+            None,
+        )
+        .unwrap();
+        let identity = WorkspaceIdentity::discover(&workspace).unwrap();
+        let before = capture_git_snapshot(&workspace).unwrap();
+        let started_at = Utc::now();
+        store
+            .record_workspace_snapshot(&WorkspaceSnapshotRecord {
+                id: EventId::new(),
+                session_id: session.id,
+                turn_id: None,
+                phase: "before_native".to_owned(),
+                fingerprint: session.workspace_fingerprint.clone(),
+                snapshot: serde_json::to_value(&before).unwrap(),
+                diff_digest: Some(before.diff_digest.clone()),
+                created_at: started_at - chrono::TimeDelta::milliseconds(1),
+            })
+            .unwrap();
+        let launch_id = uuid::Uuid::now_v7();
+        store
+            .start_native_launch(&NativeLaunchRecord {
+                id: launch_id,
+                session_id: session.id,
+                provider: ProviderKind::Claude,
+                native_session_id: uuid::Uuid::new_v4().to_string(),
+                workspace_lease_key: identity.lease_key,
+                child_pid: None,
+                state: NativeLaunchState::Started,
+                exit_code: None,
+                error: None,
+                metadata: serde_json::json!({}),
+                started_at,
+                updated_at: started_at,
+            })
+            .unwrap();
+        let mut command = if cfg!(windows) {
+            let mut command = StdCommand::new("cmd");
+            command.args(["/C", "exit", "0"]);
+            command
+        } else {
+            let mut command = StdCommand::new("sh");
+            command.args(["-c", "exit 0"]);
+            command
+        };
+        let mut dead_child = command.spawn().unwrap();
+        let dead_pid = dead_child.id();
+        assert!(dead_child.wait().unwrap().success());
+        store.record_native_launch_pid(launch_id, dead_pid).unwrap();
+        store
+            .update_native_launch(
+                launch_id,
+                NativeLaunchState::Uncertain,
+                Some(1),
+                Some("simulated dead native launch"),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let session_before = serde_json::to_value(store.get_session(session.id).unwrap()).unwrap();
+        let launch_before = serde_json::to_value(store.native_launch(launch_id).unwrap()).unwrap();
+        let events_before =
+            serde_json::to_value(store.list_events(session.id, 0, usize::MAX).unwrap()).unwrap();
+        let providers_before =
+            serde_json::to_value(store.list_provider_sessions(session.id).unwrap()).unwrap();
+        let snapshots_before =
+            serde_json::to_value(store.list_workspace_snapshots(session.id, None).unwrap())
+                .unwrap();
+
+        let error = run_native_session(
+            store.clone(),
+            paths.clone(),
+            config,
+            session.clone(),
+            Some(provider),
+            vec![std::ffi::OsString::from("--not-an-agentctl-safe-option")],
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("safe forwarding allowlist"));
+        assert_eq!(
+            serde_json::to_value(store.get_session(session.id).unwrap()).unwrap(),
+            session_before
+        );
+        assert_eq!(
+            serde_json::to_value(store.native_launch(launch_id).unwrap()).unwrap(),
+            launch_before,
+            "invalid arguments must not reconcile the dead native launch"
+        );
+        assert_eq!(
+            serde_json::to_value(store.list_events(session.id, 0, usize::MAX).unwrap()).unwrap(),
+            events_before
+        );
+        assert_eq!(
+            serde_json::to_value(store.list_provider_sessions(session.id).unwrap()).unwrap(),
+            providers_before
+        );
+        assert_eq!(
+            serde_json::to_value(store.list_workspace_snapshots(session.id, None).unwrap())
+                .unwrap(),
+            snapshots_before,
+            "invalid arguments must not capture a post-crash workspace snapshot"
+        );
+        assert!(
+            store
+                .latest_health(&ProviderKind::Claude)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.latest_health(&ProviderKind::Codex).unwrap().is_none());
+        assert!(
+            !paths.home.join("native-runtime").exists(),
+            "Claude hook settings must not be prepared"
+        );
+        assert!(
+            !paths.codex_protocol_root().exists(),
+            "Codex schema/thread preparation must not begin"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_claude_open_args_do_not_reconcile_a_dead_native_launch() {
+        assert_invalid_native_args_do_not_prepare_provider(ProviderKind::Claude).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_codex_switch_args_do_not_reconcile_a_dead_native_launch() {
+        assert_invalid_native_args_do_not_prepare_provider(ProviderKind::Codex).await;
+    }
+
+    #[test]
+    fn claude_crash_recovery_does_not_materialize_an_empty_native_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AgentctlPaths::resolve(Some(directory.path().join("home"))).unwrap();
+        let store = operations::open_store(&paths).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let session =
+            create_session(&store, &config, workspace.path(), Some("empty-crash"), None).unwrap();
+        let identity = WorkspaceIdentity::discover(workspace.path()).unwrap();
+        let now = Utc::now();
+        let native_session_id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert_provider_session(&ProviderSessionRecord {
+                id: ProviderSessionId::new(),
+                unified_session_id: session.id,
+                provider: ProviderKind::Claude,
+                native_session_id: native_session_id.clone(),
+                native_version: Some("2.1.139".to_owned()),
+                last_synced_seq: 0,
+                status: ProviderStatus::Unknown,
+                reset_at: None,
+                capabilities: BTreeMap::new(),
+                metadata: serde_json::json!({
+                    "mode": "native_interactive",
+                    "native_started": true,
+                }),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let launch_id = uuid::Uuid::now_v7();
+        store
+            .start_native_launch(&NativeLaunchRecord {
+                id: launch_id,
+                session_id: session.id,
+                provider: ProviderKind::Claude,
+                native_session_id,
+                workspace_lease_key: identity.lease_key,
+                child_pid: None,
+                state: NativeLaunchState::Started,
+                exit_code: None,
+                error: None,
+                metadata: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store.record_native_launch_pid(launch_id, 424_242).unwrap();
+        store
+            .update_native_launch(
+                launch_id,
+                NativeLaunchState::Exited,
+                Some(1),
+                None,
+                Utc::now(),
+            )
+            .unwrap();
+        let launch = store.native_launch(launch_id).unwrap().unwrap();
+
+        reconcile_claude_launch(
+            &store,
+            &config,
+            &session,
+            Some(&ProviderKind::Claude),
+            &launch,
+        )
+        .unwrap();
+
+        let provider = store
+            .provider_session(session.id, &ProviderKind::Claude)
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.metadata["native_materialized"], false);
+        assert!(provider.metadata.get("native_started").is_none());
+        assert_eq!(
+            store.native_launch(launch.id).unwrap().unwrap().state,
+            NativeLaunchState::Failed
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn claude_crash_switches_to_codex_only_as_a_non_replay_continuation() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AgentctlPaths::resolve(Some(directory.path().join("home"))).unwrap();
+        let store = operations::open_store(&paths).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let session =
+            create_session(&store, &config, workspace.path(), Some("cross-crash"), None).unwrap();
+        let identity = WorkspaceIdentity::discover(workspace.path()).unwrap();
+        let before_at = Utc::now();
+        let snapshot = GitSnapshot {
+            root: session.workspace_path.clone(),
+            head: Some("deadbeef".to_owned()),
+            branch: Some("main".to_owned()),
+            changed_paths: Vec::new(),
+            dirty: false,
+            diff_digest: "sha256:stable".to_owned(),
+            coverage_complete: true,
+            captured_at: before_at,
+        };
+        store
+            .record_workspace_snapshot(&WorkspaceSnapshotRecord {
+                id: EventId::new(),
+                session_id: session.id,
+                turn_id: None,
+                phase: "before_native".to_owned(),
+                fingerprint: session.workspace_fingerprint.clone(),
+                snapshot: serde_json::to_value(&snapshot).unwrap(),
+                diff_digest: Some(snapshot.diff_digest.clone()),
+                created_at: before_at,
+            })
+            .unwrap();
+        let launch_id = uuid::Uuid::now_v7();
+        let started_at = before_at + chrono::TimeDelta::milliseconds(1);
+        let native_session_id = uuid::Uuid::new_v4().to_string();
+        let provider_id = ProviderSessionId::new();
+        store
+            .upsert_provider_session(&ProviderSessionRecord {
+                id: provider_id,
+                unified_session_id: session.id,
+                provider: ProviderKind::Claude,
+                native_session_id: native_session_id.clone(),
+                native_version: Some("2.1.139".to_owned()),
+                last_synced_seq: 0,
+                status: ProviderStatus::Ready,
+                reset_at: None,
+                capabilities: BTreeMap::new(),
+                metadata: serde_json::json!({"native_materialized": true}),
+                created_at: before_at,
+                updated_at: before_at,
+            })
+            .unwrap();
+        store
+            .start_native_launch(&NativeLaunchRecord {
+                id: launch_id,
+                session_id: session.id,
+                provider: ProviderKind::Claude,
+                native_session_id,
+                workspace_lease_key: identity.lease_key,
+                child_pid: None,
+                state: NativeLaunchState::Started,
+                exit_code: None,
+                error: None,
+                metadata: serde_json::json!({}),
+                started_at,
+                updated_at: started_at,
+            })
+            .unwrap();
+        store.record_native_launch_pid(launch_id, 424_242).unwrap();
+        let turn_id = TurnId::new();
+        let turn_at = started_at + chrono::TimeDelta::milliseconds(1);
+        store
+            .create_turn(&TurnRecord {
+                id: turn_id,
+                session_id: session.id,
+                provider: Some(ProviderKind::Claude),
+                prompt_seq: 1,
+                status: agentctl_core::TurnStatus::Running,
+                side_effect_state: agentctl_core::SideEffectState::Confirmed,
+                native_turn_id: Some("turn-crashed".to_owned()),
+                continuation: false,
+                started_at: Some(turn_at),
+                completed_at: None,
+                created_at: turn_at,
+                updated_at: turn_at,
+            })
+            .unwrap();
+        store
+            .record_workspace_snapshot(&WorkspaceSnapshotRecord {
+                id: EventId::new(),
+                session_id: session.id,
+                turn_id: None,
+                phase: "after_native_recovery".to_owned(),
+                fingerprint: session.workspace_fingerprint.clone(),
+                snapshot: serde_json::to_value(&snapshot).unwrap(),
+                diff_digest: Some(snapshot.diff_digest.clone()),
+                created_at: turn_at + chrono::TimeDelta::milliseconds(1),
+            })
+            .unwrap();
+        store
+            .update_native_launch(
+                launch_id,
+                NativeLaunchState::Exited,
+                Some(1),
+                None,
+                Utc::now(),
+            )
+            .unwrap();
+        let launch = store.native_launch(launch_id).unwrap().unwrap();
+
+        let recovery = reconcile_claude_launch(
+            &store,
+            &config,
+            &session,
+            Some(&ProviderKind::Codex),
+            &launch,
+        )
+        .unwrap();
+
+        assert!(!recovery.clean_exit);
+        let continuation = recovery.continuation.unwrap();
+        assert_eq!(
+            continuation.side_effect_state,
+            agentctl_core::SideEffectState::Confirmed
+        );
+        assert_eq!(continuation.turn_id, Some(turn_id));
+        let turn = store.get_turn(turn_id).unwrap().unwrap();
+        assert_eq!(turn.status, agentctl_core::TurnStatus::Failed);
+        assert_eq!(
+            turn.side_effect_state,
+            agentctl_core::SideEffectState::Confirmed
+        );
+        assert!(
+            crate::native_hooks::active_claude_turn(&store, session.id)
+                .unwrap()
+                .is_none(),
+            "returning to Claude must accept a fresh user prompt"
+        );
+        let events = store.list_events(session.id, 0, usize::MAX).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "native_context_marker")
+                .count(),
+            1
+        );
+        assert!(events.iter().all(|event| event.kind != "user_prompt"));
+        assert_eq!(
+            store.native_launch(launch_id).unwrap().unwrap().state,
+            NativeLaunchState::Failed
+        );
+    }
+
+    #[test]
+    fn claude_crash_with_ambiguous_handoff_stays_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AgentctlPaths::resolve(Some(directory.path().join("home"))).unwrap();
+        let store = operations::open_store(&paths).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let session = create_session(
+            &store,
+            &config,
+            workspace.path(),
+            Some("handoff-crash"),
+            None,
+        )
+        .unwrap();
+        let identity = WorkspaceIdentity::discover(workspace.path()).unwrap();
+        let now = Utc::now();
+        let native_session_id = uuid::Uuid::new_v4().to_string();
+        let provider_id = ProviderSessionId::new();
+        store
+            .upsert_provider_session(&ProviderSessionRecord {
+                id: provider_id,
+                unified_session_id: session.id,
+                provider: ProviderKind::Claude,
+                native_session_id: native_session_id.clone(),
+                native_version: None,
+                last_synced_seq: 0,
+                status: ProviderStatus::Ready,
+                reset_at: None,
+                capabilities: BTreeMap::new(),
+                metadata: serde_json::json!({}),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let launch_id = uuid::Uuid::now_v7();
+        store
+            .start_native_launch(&NativeLaunchRecord {
+                id: launch_id,
+                session_id: session.id,
+                provider: ProviderKind::Claude,
+                native_session_id: native_session_id.clone(),
+                workspace_lease_key: identity.lease_key,
+                child_pid: None,
+                state: NativeLaunchState::Started,
+                exit_code: None,
+                error: None,
+                metadata: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store
+            .stage_native_handoff(&agentctl_storage::NativeHandoffRecord {
+                launch_id,
+                provider_session_id: provider_id,
+                session_id: session.id,
+                native_session_id,
+                through_seq: 0,
+                capsule: "<agent-handoff/>".to_owned(),
+                content_digest: "sha256:test".to_owned(),
+                state: agentctl_storage::NativeHandoffState::Staged,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store.begin_native_handoff_delivery(launch_id).unwrap();
+        let launch = store.native_launch(launch_id).unwrap().unwrap();
+
+        let error = ensure_claude_handoff_is_replay_safe(&store, &launch)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("may already have been delivered"));
+        assert_eq!(
+            store.native_launch(launch_id).unwrap().unwrap().state,
+            NativeLaunchState::Started
+        );
+        assert!(
+            store
+                .list_events(session.id, 0, usize::MAX)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "native_context_marker")
+        );
+    }
+
     #[test]
     fn post_spawn_codex_error_without_pid_receipt_stays_uncertain() {
         let directory = tempfile::tempdir().unwrap();
@@ -2261,7 +3019,74 @@ mod routing_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    use std::os::unix::process::CommandExt;
+
+    #[tokio::test]
+    async fn live_native_process_group_blocks_cross_provider_reconciliation() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AgentctlPaths::resolve(Some(directory.path().join("home"))).unwrap();
+        let store = operations::open_store(&paths).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let session =
+            create_session(&store, &config, workspace.path(), Some("live-launch"), None).unwrap();
+        let identity = WorkspaceIdentity::discover(workspace.path()).unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let launch_id = uuid::Uuid::now_v7();
+        let now = Utc::now();
+        store
+            .start_native_launch(&NativeLaunchRecord {
+                id: launch_id,
+                session_id: session.id,
+                provider: ProviderKind::Claude,
+                native_session_id: uuid::Uuid::new_v4().to_string(),
+                workspace_lease_key: identity.lease_key.clone(),
+                child_pid: None,
+                state: NativeLaunchState::Started,
+                exit_code: None,
+                error: None,
+                metadata: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store.record_native_launch_pid(launch_id, pid).unwrap();
+
+        let error = reconcile_open_native_launch(
+            &store,
+            &paths,
+            &config,
+            &session,
+            &identity,
+            Some(&ProviderKind::Codex),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        agentctl_workspace::kill_process_group(agentctl_workspace::ProcessGroupId::from_child_id(
+            pid,
+        ))
+        .unwrap();
+        let _ = child.wait();
+        assert!(error.contains("still running as process group"));
+        assert_eq!(
+            store.native_launch(launch_id).unwrap().unwrap().state,
+            NativeLaunchState::Started
+        );
+        assert!(
+            store
+                .list_events(session.id, 0, usize::MAX)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "native_context_marker")
+        );
+    }
 
     #[test]
     fn committed_native_import_reports_shutdown_failure_as_warning() {

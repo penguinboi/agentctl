@@ -25,13 +25,16 @@ use crate::{
     jsonrpc::{CodexRpcClient, RpcInbound},
     mapping::{map_notification, parse_rate_limit},
     process::spawn_app_server,
-    schema::{CodexInstallation, detect_installation, generate_schema_cache},
+    schema::{
+        CodexInstallation, detect_installation, generate_schema_cache, generate_schema_cache_under,
+    },
 };
 
 #[derive(Clone, Debug)]
 pub struct CodexConfig {
     pub binary: PathBuf,
-    pub schema_cache: Option<PathBuf>,
+    /// Root containing one generated schema directory per installed Codex version.
+    pub schema_cache_root: Option<PathBuf>,
     pub channel_capacity: usize,
     pub request_timeout: Duration,
 }
@@ -40,7 +43,7 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             binary: PathBuf::from("codex"),
-            schema_cache: None,
+            schema_cache_root: None,
             channel_capacity: 256,
             request_timeout: Duration::from_secs(30),
         }
@@ -50,6 +53,8 @@ impl Default for CodexConfig {
 const THREAD_SNAPSHOT_PAGE_SIZE: u32 = 100;
 const MAX_THREAD_SNAPSHOT_PAGES: usize = 64;
 pub const MAX_INTERACTIVE_THREAD_SNAPSHOT: usize = 4096;
+const NEW_THREAD_MATERIALIZATION_MARKER: &str =
+    r#"<agentctl-session-marker version="1" purpose="rollout-materialization" />"#;
 
 /// Minimal, non-transcript metadata used to detect native `/new`, `/fork`, or
 /// thread switching while the Codex TUI owns the terminal.
@@ -98,11 +103,11 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
-    /// Creates an adapter for a concrete binary and optional pre-generated schema directory.
-    pub fn new(binary: impl Into<PathBuf>, schema_cache: Option<PathBuf>) -> Self {
+    /// Creates an adapter for a concrete binary and optional versioned schema-cache root.
+    pub fn new(binary: impl Into<PathBuf>, schema_cache_root: Option<PathBuf>) -> Self {
         Self::from_config(CodexConfig {
             binary: binary.into(),
-            schema_cache,
+            schema_cache_root,
             ..CodexConfig::default()
         })
     }
@@ -241,12 +246,11 @@ impl CodexAdapter {
 
     /// Returns an existing schema directory or generates one for the installed version.
     pub async fn prepare_schema(&self) -> Result<PathBuf, ProviderError> {
-        if let Some(directory) = &self.config.schema_cache
-            && directory.is_dir()
-        {
-            return Ok(directory.clone());
+        let installation = self.installation().await?;
+        if let Some(root) = &self.config.schema_cache_root {
+            return generate_schema_cache_under(&installation, root).await;
         }
-        generate_schema_cache(&self.installation().await?).await
+        generate_schema_cache(&installation).await
     }
 
     async fn installation(&self) -> Result<CodexInstallation, ProviderError> {
@@ -323,6 +327,39 @@ impl CodexAdapter {
         Ok(())
     }
 
+    async fn materialize_new_thread(
+        &self,
+        client: &CodexRpcClient,
+        thread_id: &str,
+    ) -> Result<(), ProviderError> {
+        client
+            .request(
+                "thread/inject_items",
+                json!({
+                    "threadId": thread_id,
+                    "items": [new_thread_materialization_item()]
+                }),
+            )
+            .await?;
+        let response = client
+            .request(
+                "thread/read",
+                json!({
+                    "threadId": thread_id,
+                    "includeTurns": true,
+                }),
+            )
+            .await?;
+        let transcript = parse_native_transcript(thread_id, &response.result)?;
+        if !transcript.turns.is_empty() {
+            return Err(ProviderError::Incompatible(
+                "Codex exposed agentctl's rollout-materialization marker as a native turn"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn create_or_resume_thread(
         &self,
         context: &SessionContext,
@@ -352,6 +389,14 @@ impl CodexAdapter {
             return Ok(resumed);
         }
 
+        // Codex 0.144 only reserves an in-memory id for an otherwise empty
+        // `thread/start`; no rollout exists for a later native `codex resume`
+        // until at least one model-history item is persisted. Validate the two
+        // no-model endpoints before creating the thread so an incompatible
+        // installation does not leave an avoidable orphan id.
+        self.require_installed_client_method("thread/inject_items")
+            .await?;
+        self.require_installed_client_method("thread/read").await?;
         let response = client
             .request(
                 "thread/start",
@@ -363,6 +408,7 @@ impl CodexAdapter {
         let thread_id = extract_thread_id(&response.result).ok_or_else(|| {
             ProviderError::Protocol("thread/start omitted the thread id".to_owned())
         })?;
+        self.materialize_new_thread(&client, &thread_id).await?;
         client.mark_thread_loaded(&thread_id).await;
         self.sessions
             .write()
@@ -1943,6 +1989,17 @@ fn projection_items(batch: &SyncBatch) -> Vec<Value> {
     items
 }
 
+fn new_thread_materialization_item() -> Value {
+    json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": NEW_THREAD_MATERIALIZATION_MARKER
+        }]
+    })
+}
+
 fn notification_matches(params: &Value, thread_id: &str, turn_id: &str) -> bool {
     let event_thread = params
         .get("threadId")
@@ -2105,10 +2162,10 @@ fn approval_result(pending: &PendingApproval, decision: ApprovalDecision) -> Val
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexAdapter, CodexConfig, MAX_THREAD_SNAPSHOT_PAGES, PendingApproval,
-        ThreadSnapshotAccumulator, approval_result, classify_terminal_turn,
-        parse_native_transcript, projection_items, resumed_thread_id, turn_start_params,
-        validate_native_session_id,
+        CodexAdapter, CodexConfig, MAX_THREAD_SNAPSHOT_PAGES, NEW_THREAD_MATERIALIZATION_MARKER,
+        PendingApproval, ThreadSnapshotAccumulator, approval_result, classify_terminal_turn,
+        new_thread_materialization_item, parse_native_transcript, projection_items,
+        resumed_thread_id, turn_start_params, validate_native_session_id,
     };
     use agentctl_core::{
         AgentProvider, ApprovalDecision, CanonicalEvent, EventId, EventVisibility,
@@ -2137,7 +2194,9 @@ mod tests {
     #[tokio::test]
     async fn native_history_requires_thread_read_in_the_installed_version_schema() {
         let directory = tempfile::tempdir().unwrap();
-        let schema_path = directory.path().join("ClientRequest.json");
+        let schema_directory = directory.path().join("test");
+        tokio::fs::create_dir(&schema_directory).await.unwrap();
+        let schema_path = schema_directory.join("ClientRequest.json");
         tokio::fs::write(
             &schema_path,
             serde_json::to_vec(
@@ -2149,8 +2208,12 @@ mod tests {
         .unwrap();
         let adapter = CodexAdapter::from_config(CodexConfig {
             binary: PathBuf::from("binary-must-not-run"),
-            schema_cache: Some(directory.path().to_path_buf()),
+            schema_cache_root: Some(directory.path().to_path_buf()),
             ..CodexConfig::default()
+        });
+        *adapter.installation.write().await = Some(crate::schema::CodexInstallation {
+            binary: PathBuf::from("binary-must-not-run"),
+            version: "test".to_owned(),
         });
         adapter
             .require_installed_client_method("thread/read")
@@ -2226,6 +2289,21 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["role"], "assistant");
         assert_eq!(items[1]["content"][0]["text"], "<agent-handoff/>");
+    }
+
+    #[test]
+    fn new_thread_materialization_uses_one_neutral_assistant_item() {
+        let item = new_thread_materialization_item();
+        assert_eq!(item["type"], "message");
+        assert_eq!(item["role"], "assistant");
+        assert_eq!(item["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(item["content"][0]["type"], "output_text");
+        assert_eq!(
+            item["content"][0]["text"],
+            NEW_THREAD_MATERIALIZATION_MARKER
+        );
+        assert!(NEW_THREAD_MATERIALIZATION_MARKER.starts_with("<agentctl-session-marker "));
+        assert!(NEW_THREAD_MATERIALIZATION_MARKER.ends_with(" />"));
     }
 
     #[test]

@@ -12,4 +12,6 @@ pub use adapter::{
 };
 pub use jsonrpc::{RpcInbound, RpcResponse};
 pub use mapping::{map_notification, parse_rate_limit};
-pub use schema::{CodexInstallation, detect_installation, generate_schema_cache};
+pub use schema::{
+    CodexInstallation, detect_installation, generate_schema_cache, generate_schema_cache_under,
+};

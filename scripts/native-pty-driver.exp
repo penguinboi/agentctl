@@ -1,0 +1,205 @@
+#!/usr/bin/expect -f
+
+# Drives only the lifecycle boundary of a provider-native interactive CLI.
+# It deliberately never submits a conversational prompt.
+
+proc required_env {name} {
+    if {![info exists ::env($name)] || $::env($name) eq ""} {
+        puts stderr "native PTY driver: missing environment variable $name"
+        exit 64
+    }
+    return $::env($name)
+}
+
+proc write_marker {path value} {
+    set channel [open $path w]
+    puts $channel $value
+    close $channel
+}
+
+proc native_child_started {agentctl_pid provider} {
+    if {[catch {exec ps -e -o ppid= -o args=} processes]} {
+        return 0
+    }
+    foreach line [split $processes "\n"] {
+        if {![regexp {^[[:space:]]*([0-9]+)[[:space:]]+(.*)$} $line _ ppid command]} {
+            continue
+        }
+        if {$ppid != $agentctl_pid} {
+            continue
+        }
+        if {$provider eq "claude"
+            && [regexp -- {--(session-id|resume)[[:space:]].*--settings[[:space:]]} $command]} {
+            return 1
+        }
+        if {$provider eq "codex"
+            && [regexp -- {[[:space:]]resume[[:space:]].*--cd[[:space:]]} $command]
+            && ![regexp -- {[[:space:]]app-server([[:space:]]|$)} $command]} {
+            return 1
+        }
+    }
+    return 0
+}
+
+proc finish_child {context} {
+    set waited [wait]
+    set os_error [lindex $waited 2]
+    set status [lindex $waited 3]
+    if {$os_error != 0} {
+        puts stderr "native PTY driver: $context (wait result: $waited)"
+        exit 1
+    }
+    if {$status != 0} {
+        puts stderr "native PTY driver: $context (exit status: $status)"
+    }
+    exit $status
+}
+
+if {$argc == 0} {
+    puts stderr "usage: native-pty-driver.exp command ?argument ...?"
+    exit 64
+}
+
+set ready_file [required_env "AGENTCTL_E2E_READY_FILE"]
+set release_file [required_env "AGENTCTL_E2E_RELEASE_FILE"]
+set exit_text [required_env "AGENTCTL_E2E_EXIT_TEXT"]
+set provider [required_env "AGENTCTL_E2E_PROVIDER"]
+set startup_seconds 12
+set native_start_seconds 45
+set release_seconds 90
+set exit_seconds 25
+if {[info exists ::env(AGENTCTL_E2E_STARTUP_SECONDS)]} {
+    set startup_seconds $::env(AGENTCTL_E2E_STARTUP_SECONDS)
+}
+if {[info exists ::env(AGENTCTL_E2E_RELEASE_SECONDS)]} {
+    set release_seconds $::env(AGENTCTL_E2E_RELEASE_SECONDS)
+}
+if {[info exists ::env(AGENTCTL_E2E_NATIVE_START_SECONDS)]} {
+    set native_start_seconds $::env(AGENTCTL_E2E_NATIVE_START_SECONDS)
+}
+if {[info exists ::env(AGENTCTL_E2E_EXIT_SECONDS)]} {
+    set exit_seconds $::env(AGENTCTL_E2E_EXIT_SECONDS)
+}
+
+set timeout 1
+log_user 1
+spawn -noecho {*}$argv
+set child_pid [exp_pid]
+
+# Wait for the wrapper's provider-native child rather than merely waiting for
+# agentctl itself. Codex performs app-server preparation before `codex resume`,
+# and input sent during that phase would later land in the wrong native screen.
+set native_start_deadline [expr {[clock milliseconds] + ($native_start_seconds * 1000)}]
+while {![native_child_started $child_pid $provider]} {
+    if {[clock milliseconds] >= $native_start_deadline} {
+        puts stderr "native PTY driver: timed out waiting for native $provider child"
+        send -- "\003"
+        exit 124
+    }
+    expect {
+        eof {
+            finish_child "wrapper exited before spawning its native provider CLI"
+        }
+        timeout {}
+    }
+}
+
+# Both providers can ask whether a previously unseen worktree is trusted. The
+# smoke owns a brand-new disposable repository, so accepting the default choice
+# is bounded to test data. If no trust screen appears, these are empty-editor
+# Enter events and do not start a model turn.
+set trust_at [expr {[clock milliseconds] + 2000}]
+while {[clock milliseconds] < $trust_at} {
+    expect {
+        -re {Do you trust} {
+            after 250
+            send -- "\r"
+        }
+        eof { finish_child "native command exited during UI startup" }
+        timeout {}
+    }
+}
+if {$provider eq "codex"} {
+    # Codex paints this prompt one character at a time with cursor escapes, so
+    # matching its visual sentence is not reliable in a PTY transcript.
+    send -- "\r"
+    after 350
+    send -- "\033\[13;1u"
+}
+
+# Let provider startup, update notices, hooks, and MCP initialization settle
+# before the parent performs assertions and asks this driver to exit.
+set settle_seconds [expr {max(0, $startup_seconds - 2)}]
+set ready_at [expr {[clock milliseconds] + ($settle_seconds * 1000)}]
+while {[clock milliseconds] < $ready_at} {
+    expect {
+        -re {Do you trust} {
+            after 250
+            send -- "\r"
+        }
+        eof { finish_child "native command exited before its interface became ready" }
+        timeout {}
+    }
+}
+write_marker $ready_file $child_pid
+
+set release_at [expr {[clock milliseconds] + ($release_seconds * 1000)}]
+while {![file exists $release_file]} {
+    if {[clock milliseconds] >= $release_at} {
+        puts stderr "native PTY driver: timed out waiting for lifecycle release"
+        send -- "\003"
+        expect {
+            eof { finish_child "native command timed out before release" }
+            timeout {}
+        }
+        exit 124
+    }
+    expect {
+        eof {
+            finish_child "native command exited before lifecycle release"
+        }
+        timeout {}
+    }
+}
+
+# Keep the text and Enter operations separate. Claude Code's native editor can
+# otherwise interpret a single PTY burst as a paste instead of a slash command.
+send -- $exit_text
+after 350
+send -- "\r"
+
+# Enhanced-keyboard terminals may ignore a legacy CR. Send a kitty CSI-u Enter
+# only if the native command is still alive after a short grace period.
+set legacy_enter_deadline [expr {[clock milliseconds] + 2000}]
+while {[clock milliseconds] < $legacy_enter_deadline} {
+    expect {
+        eof { finish_child "native command completed" }
+        timeout {}
+    }
+}
+send -- "\033\[13;1u"
+
+set exit_at [expr {[clock milliseconds] + ($exit_seconds * 1000)}]
+while {[clock milliseconds] < $exit_at} {
+    expect {
+        eof { finish_child "native command completed" }
+        timeout {}
+    }
+}
+
+puts stderr "native PTY driver: slash command did not exit; interrupting child"
+send -- "\003"
+set timeout 3
+expect {
+    eof { finish_child "native command required an interrupt" }
+    timeout {
+        send -- "\003"
+        expect {
+            eof { finish_child "native command required two interrupts" }
+            timeout {
+                puts stderr "native PTY driver: child did not stop after two interrupts"
+                exit 124
+            }
+        }
+    }
+}

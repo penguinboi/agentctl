@@ -4,6 +4,7 @@ use agentctl_core::{
     AgentEvent, AgentProvider, AuthMode, CanonicalEvent, EventId, EventVisibility, ProviderKind,
     SessionContext, SyncBatch, TurnId, TurnRequest, TurnStatus, UnifiedSessionId,
 };
+use agentctl_provider_codex::{detect_installation, generate_schema_cache_under};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -287,36 +288,18 @@ async fn run_interrupt_probe(
 
 async fn inspect_codex(paths: &AgentctlPaths, binary: &str) -> Vec<CompatibilityCheck> {
     let mut checks = Vec::new();
-    let version = command_output(binary, &["--version"]).await;
-    let Ok(version) = version else {
-        checks.push(failed("codex", "binary", version.unwrap_err().to_string()));
-        return checks;
+    let installation = match detect_installation(Path::new(binary)).await {
+        Ok(installation) => installation,
+        Err(error) => {
+            checks.push(failed("codex", "binary", error.to_string()));
+            return checks;
+        }
     };
-    checks.push(passed("codex", "binary", version.trim().to_owned()));
+    checks.push(passed("codex", "binary", installation.version.clone()));
 
-    let safe_version = version
-        .split_whitespace()
-        .last()
-        .unwrap_or("unknown")
-        .replace(
-            |character: char| !character.is_ascii_alphanumeric() && character != '.',
-            "_",
-        );
-    let schema_dir = paths.protocols.join("codex").join(safe_version);
-    if let Err(error) = fs::create_dir_all(&schema_dir).await {
-        checks.push(failed("codex", "schema cache", error.to_string()));
-        return checks;
-    }
-    let schema = Command::new(binary)
-        .args(["app-server", "generate-json-schema", "--out"])
-        .arg(&schema_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
+    let schema = generate_schema_cache_under(&installation, &paths.codex_protocol_root()).await;
     match schema {
-        Ok(output) if output.status.success() => {
+        Ok(schema_dir) => {
             if let Err(error) = set_private_tree(&schema_dir) {
                 checks.push(failed(
                     "codex",
@@ -355,11 +338,6 @@ async fn inspect_codex(paths: &AgentctlPaths, binary: &str) -> Vec<Compatibility
                 Err(error) => checks.push(failed("codex", "request schema", error.to_string())),
             }
         }
-        Ok(output) => checks.push(failed(
-            "codex",
-            "installed-version schema",
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        )),
         Err(error) => checks.push(failed(
             "codex",
             "installed-version schema",

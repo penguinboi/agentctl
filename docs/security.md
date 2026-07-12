@@ -5,6 +5,12 @@ installed Claude Code and Codex CLIs. The foreground provider also retains its
 normal permission prompts, sandbox behavior, MCP configuration, tools, and
 hooks. The wrapper does not enable a provider bypass mode.
 
+Allowlisted security options supplied explicitly after `--` remain native user
+choices. Codex `--sandbox` / `--ask-for-approval` and Claude
+`--permission-mode` can weaken provider defaults. `agentctl` never supplies
+them automatically and rejects the providers' all-in-one bypass flags, but it
+does not silently override an explicit user choice.
+
 ## Wrapper and workspace boundary
 
 A mapped native session must be opened through `agentctl`. The wrapper pins its
@@ -18,13 +24,17 @@ it. Running the same mapped session directly or concurrently is out of band and
 can make safe migration impossible.
 
 Forwarded arguments use an explicit provider allowlist. Arguments that replace
-the mapped session, working directory, settings overlay, security boundary, or
-foreground lifecycle are rejected. Positional arguments are rejected because
-they are native initial prompts; unknown options remain disabled until their
-arity and ownership are reviewed. Session-changing commands inside a provider
-are also outside the supported contract: exit and use `agentctl` instead. A
-detected native-session mismatch blocks the bridge and journals the launch as
-failed or uncertain.
+the mapped session, working directory, settings overlay, capture hooks, or
+foreground lifecycle are rejected. Selected native security controls are
+accepted only as explicit user input as described above. Positional arguments
+are rejected because they are native initial prompts; unknown options remain
+disabled until their arity and ownership are reviewed. Validation runs at the
+common provider-selection boundary before projection, provider binding,
+routing, launch journaling, settings creation, or workspace snapshots.
+Session-changing
+commands inside a provider are also outside the supported contract: exit and
+use `agentctl` instead. A detected native-session mismatch blocks the bridge
+and journals the launch as failed or uncertain.
 
 Claude hook invocations are untrusted process input. They are accepted only for
 the exact open launch, canonical session, native session UUID, provider, and
