@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentctl.dev/schemas/project-config/v1.json",
+  "title": "agentctl project configuration",
+  "description": "Repository-scoped configuration. Security-sensitive and machine-local settings are intentionally forbidden.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {
+          "enum": ["manual", "claude-first", "codex-first", "balanced", "sticky-balanced"]
+        },
+        "switch_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "failure_window_seconds": { "type": "integer", "minimum": 1 },
+        "max_recent_failures": { "type": "integer", "minimum": 0 },
+        "affinity": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              { "enum": ["auto", "claude", "codex"] },
+              { "type": "string", "pattern": "^plugin:[a-z][a-z0-9_-]*$" }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

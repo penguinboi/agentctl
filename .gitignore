@@ -1,0 +1,8 @@
+/target/
+/.agentctl/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+compatibility-report.json
+protocol-capabilities.json

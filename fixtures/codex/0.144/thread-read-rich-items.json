@@ -1,0 +1,125 @@
+{
+  "thread": {
+    "id": "thr_rich",
+    "cwd": "/repo",
+    "turns": [
+      {
+        "id": "turn_rich",
+        "status": "completed",
+        "items": [
+          {
+            "type": "userMessage",
+            "id": "user_rich",
+            "content": [
+              { "type": "text", "text": "Inspect these inputs" },
+              { "type": "image", "url": "data:image/png;base64,PRIVATE_REMOTE_BYTES", "detail": "high" },
+              { "type": "localImage", "path": "/repo/private/local.png", "detail": "original" },
+              { "type": "skill", "name": "review", "path": "/repo/.agents/skills/review/SKILL.md" },
+              { "type": "mention", "name": "architecture", "path": "/repo/docs/architecture.md" }
+            ]
+          },
+          {
+            "type": "mcpToolCall",
+            "id": "mcp_1",
+            "server": "github",
+            "tool": "get_issue",
+            "arguments": { "owner": "secret-owner", "repo": "secret-repo", "number": 42 },
+            "status": "completed",
+            "result": {
+              "content": [
+                { "type": "text", "text": "PRIVATE_MCP_OUTPUT" },
+                { "type": "image", "data": "PRIVATE_MCP_IMAGE", "mimeType": "image/png" }
+              ],
+              "structuredContent": { "private": "PRIVATE_STRUCTURED_OUTPUT" }
+            },
+            "error": null
+          },
+          {
+            "type": "dynamicToolCall",
+            "id": "dynamic_1",
+            "namespace": "browser",
+            "tool": "inspect",
+            "arguments": { "url": "https://private.example/path", "selector": "#secret" },
+            "status": "completed",
+            "success": true,
+            "contentItems": [
+              { "type": "inputText", "text": "PRIVATE_DYNAMIC_OUTPUT" },
+              { "type": "inputImage", "imageUrl": "data:image/jpeg;base64,PRIVATE_DYNAMIC_IMAGE" }
+            ]
+          },
+          {
+            "type": "webSearch",
+            "id": "web_1",
+            "query": "private acquisition target",
+            "action": { "type": "search", "query": "private acquisition target", "queries": null }
+          },
+          {
+            "type": "imageGeneration",
+            "id": "image_gen_1",
+            "status": "completed",
+            "result": "data:image/png;base64,PRIVATE_GENERATED_IMAGE",
+            "revisedPrompt": "PRIVATE_REVISED_PROMPT",
+            "savedPath": "/repo/output/private-generated.png"
+          },
+          {
+            "type": "imageView",
+            "id": "image_view_1",
+            "path": "/repo/input/private-view.png"
+          },
+          {
+            "type": "hookPrompt",
+            "id": "hook_1",
+            "fragments": [
+              { "hookRunId": "hook-run", "text": "PRIVATE_HOOK_PROMPT" }
+            ]
+          },
+          {
+            "type": "contextCompaction",
+            "id": "compact_1"
+          },
+          {
+            "type": "sleep",
+            "id": "sleep_1",
+            "durationMs": 250
+          },
+          {
+            "type": "collabAgentToolCall",
+            "id": "collab_1",
+            "tool": "spawnAgent",
+            "status": "completed",
+            "senderThreadId": "thread-parent",
+            "receiverThreadIds": ["thread-child"],
+            "agentsStates": {
+              "thread-child": { "status": "completed", "message": "PRIVATE_SUBAGENT_OUTPUT" }
+            },
+            "prompt": "PRIVATE_SUBAGENT_PROMPT",
+            "model": null
+          },
+          {
+            "type": "subAgentActivity",
+            "id": "subagent_1",
+            "agentPath": "child",
+            "agentThreadId": "thread-child",
+            "kind": "started"
+          },
+          {
+            "type": "enteredReviewMode",
+            "id": "review_enter_1",
+            "review": "Review the current implementation."
+          },
+          {
+            "type": "exitedReviewMode",
+            "id": "review_exit_1",
+            "review": "Review complete."
+          },
+          {
+            "type": "agentMessage",
+            "id": "assistant_rich",
+            "text": "Completed the native workflow.",
+            "phase": "final_answer"
+          }
+        ]
+      }
+    ]
+  }
+}

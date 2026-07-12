@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Verify tag matches workspace version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          expected = f"v{manifest['workspace']['package']['version']}"
+          actual = os.environ["RELEASE_TAG"]
+          if actual != expected:
+              raise SystemExit(f"release tag {actual!r} must equal {expected!r}")
+          PY
+
+  build:
+    needs: [quality, verify-tag]
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.0
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p agentctl
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          package="agentctl-${TARGET}"
+          mkdir -p "dist/${package}"
+          cp "target/${TARGET}/release/agentctl" "dist/${package}/agentctl"
+          cp LICENSE README.md "dist/${package}/"
+          tar -C dist -czf "${package}.tar.gz" "${package}"
+          shasum -a 256 "${package}.tar.gz" > "${package}.tar.gz.sha256"
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            agentctl-${{ matrix.target }}.tar.gz
+            agentctl-${{ matrix.target }}.tar.gz.sha256
+
+  build-windows:
+    needs: [quality, verify-tag]
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.0
+          targets: x86_64-pc-windows-msvc
+      - run: cargo build --release --locked --target $env:TARGET -p agentctl
+      - name: Package
+        shell: pwsh
+        run: |
+          $package = "agentctl-$env:TARGET"
+          New-Item -ItemType Directory -Force "dist/$package" | Out-Null
+          Copy-Item "target/$env:TARGET/release/agentctl.exe" "dist/$package/agentctl.exe"
+          Copy-Item LICENSE, README.md "dist/$package/"
+          Compress-Archive -Path "dist/$package" -DestinationPath "$package.zip"
+          $hash = (Get-FileHash "$package.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $package.zip" | Set-Content -Encoding ascii "$package.zip.sha256"
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            agentctl-x86_64-pc-windows-msvc.zip
+            agentctl-x86_64-pc-windows-msvc.zip.sha256

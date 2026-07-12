@@ -1,0 +1,48 @@
+[package]
+name = "agentctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
+publish = false
+
+[[bin]]
+name = "agentctl"
+path = "src/main.rs"
+
+[dependencies]
+agentctl-core.workspace = true
+agentctl-plugin-protocol.workspace = true
+agentctl-provider-claude.workspace = true
+agentctl-provider-codex.workspace = true
+agentctl-storage.workspace = true
+agentctl-telemetry.workspace = true
+agentctl-transcript.workspace = true
+agentctl-workspace.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+directories.workspace = true
+futures.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zstd.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+agentctl-testkit.workspace = true
+
+[lints]
+workspace = true

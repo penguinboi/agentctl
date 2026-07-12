@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"00000000-0000-4000-8000-000000000001","model":"fixture"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"fixture"}]}}
+{"type":"result","subtype":"success","result":"fixture","usage":{"input_tokens":1,"output_tokens":1}}

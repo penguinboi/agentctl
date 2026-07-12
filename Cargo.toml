@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/cli",
+  "crates/core",
+  "crates/routing",
+  "crates/transcript",
+  "crates/provider-codex",
+  "crates/provider-claude",
+  "crates/approvals",
+  "crates/workspace",
+  "crates/storage",
+  "crates/telemetry",
+  "crates/plugin-protocol",
+  "crates/testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+authors = ["agentctl contributors"]
+description = "A local control plane for native coding agents"
+publish = false
+
+[workspace.dependencies]
+agentctl-core = { path = "crates/core", version = "0.1.0" }
+agentctl-routing = { path = "crates/routing", version = "0.1.0" }
+agentctl-transcript = { path = "crates/transcript", version = "0.1.0" }
+agentctl-provider-codex = { path = "crates/provider-codex", version = "0.1.0" }
+agentctl-provider-claude = { path = "crates/provider-claude", version = "0.1.0" }
+agentctl-approvals = { path = "crates/approvals", version = "0.1.0" }
+agentctl-workspace = { path = "crates/workspace", version = "0.1.0" }
+agentctl-storage = { path = "crates/storage", version = "0.1.0" }
+agentctl-telemetry = { path = "crates/telemetry", version = "0.1.0" }
+agentctl-plugin-protocol = { path = "crates/plugin-protocol", version = "0.1.0" }
+agentctl-testkit = { path = "crates/testkit", version = "0.1.0" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+directories = "6.0"
+fs2 = "0.4"
+futures = "0.3"
+hex = "0.4"
+nix = { version = "0.30", features = ["process", "signal", "term"] }
+proptest = "1.7"
+regex = "1.11"
+rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid"] }
+schemars = { version = "1.0", features = ["chrono04", "uuid1"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["io-util", "sync"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1.18", features = ["v4", "v7", "serde"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+zstd = "0.13"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,6 @@
+{"method":"item/agentMessage/delta","params":{"threadId":"thr_1","turnId":"turn_1","itemId":"msg_1","delta":"Done"}}
+{"method":"item/started","params":{"threadId":"thr_1","turnId":"turn_1","startedAtMs":1,"item":{"type":"commandExecution","id":"cmd_1","command":"cargo test","cwd":"/repo","status":"inProgress","commandActions":[]}}}
+{"method":"item/completed","params":{"threadId":"thr_1","turnId":"turn_1","completedAtMs":2,"item":{"type":"commandExecution","id":"cmd_1","command":"cargo test","cwd":"/repo","status":"completed","commandActions":[],"exitCode":0}}}
+{"method":"item/completed","params":{"threadId":"thr_1","turnId":"turn_1","completedAtMs":3,"item":{"type":"fileChange","id":"patch_1","status":"completed","changes":[{"path":"src/lib.rs","kind":{"type":"update"},"diff":"@@"}]}}}
+{"method":"item/completed","params":{"threadId":"thr_1","turnId":"turn_1","completedAtMs":4,"item":{"type":"agentMessage","id":"msg_1","text":"Done"}}}
+{"method":"turn/completed","params":{"threadId":"thr_1","turn":{"id":"turn_1","status":"completed","items":[]}}}
