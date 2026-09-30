@@ -1611,7 +1611,7 @@ async fn load_native_provider(
     kind: &ProviderKind,
 ) -> Result<Arc<dyn AgentProvider>> {
     match kind {
-        ProviderKind::Codex => Ok(Arc::new(CodexAdapter::new(
+        ProviderKind::Codex => Ok(Arc::new(CodexAdapter::for_interactive_sessions(
             &config.providers.codex_binary,
             Some(paths.codex_protocol_root()),
         ))),
