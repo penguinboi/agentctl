@@ -1,3 +1,5 @@
+// ABOUTME: Connects Codex native sessions to canonical events and provider operations.
+// ABOUTME: Reads native history and manages the official app-server protocol.
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -527,7 +529,6 @@ impl AgentProvider for CodexAdapter {
         validate_session(session)?;
         self.require_installed_client_method("thread/read").await?;
         let client = self.client().await?;
-        self.ensure_thread_loaded(&client, session, None).await?;
         let response = client
             .request(
                 "thread/read",

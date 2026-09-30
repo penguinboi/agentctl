@@ -1,3 +1,5 @@
+// ABOUTME: Exercises the installed Codex app-server against disposable native sessions.
+// ABOUTME: Verifies protocol behavior without submitting conversational model turns.
 use agentctl_core::{
     AgentProvider, AuthMode, CanonicalEvent, EventId, EventVisibility, ProviderStatus,
     SessionContext, SyncBatch, UnifiedSessionId,
@@ -97,4 +99,30 @@ async fn installed_thread_injection_and_restart_resume() {
         "thread/inject_items must not be recaptured as a user-authored native turn"
     );
     restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a locally installed Codex CLI"]
+async fn installed_native_history_can_be_read_while_another_client_owns_the_thread() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let context = SessionContext {
+        unified_session_id: UnifiedSessionId::new(),
+        workspace_root: workspace.path().to_path_buf(),
+        workspace_fingerprint: "history-reader-live-probe".to_owned(),
+        auth_mode: AuthMode::NativeLocal,
+    };
+    let owner = CodexAdapter::new("codex", None);
+    let session = owner.ensure_session(&context).await.unwrap();
+    let reader = CodexAdapter::new("codex", None);
+    let transcript = reader.read_native_history(&session).await;
+    reader.shutdown().await.unwrap();
+    owner.shutdown().await.unwrap();
+
+    let transcript = transcript.unwrap();
+    assert_eq!(transcript.native_session_id, session.native_session_id);
+    assert_eq!(
+        transcript.workspace_cwd,
+        workspace.path().canonicalize().unwrap()
+    );
+    assert!(transcript.turns.is_empty());
 }
