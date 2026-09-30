@@ -289,7 +289,7 @@ impl CodexAdapter {
         }
         #[cfg(unix)]
         let socket = if self.config.interactive {
-            crate::process::native_socket(&self.config.binary).await?
+            crate::process::interactive_endpoint(&self.config.binary).await?
         } else {
             None
         };

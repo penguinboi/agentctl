@@ -15,7 +15,7 @@ pub(crate) async fn spawn_app_server(
 }
 
 #[cfg(unix)]
-pub(crate) async fn native_socket(
+pub async fn interactive_endpoint(
     binary: &Path,
 ) -> Result<Option<std::path::PathBuf>, ProviderError> {
     use directories::BaseDirs;

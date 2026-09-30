@@ -32,6 +32,23 @@ complete `initialize`/`initialized`. The control connection is used to:
 - inspect account, capability, usage, and rate-limit signals;
 - generate and cache the installed version's JSON Schema.
 
+With a running native daemon on Unix, each Codex CLI launch connects through a
+private local relay using the CLI's `--remote` option. Relay endpoints last for
+one launch; reopen with `agentctl open codex --session NAME` after exit.
+The relay forwards native
+protocol traffic and journals successful thread selections from that connection.
+It stores thread IDs, pending selection count, and completion state; prompts and
+tool payloads are not stored in this evidence. Ephemeral `thread_title` requests
+are background title generation and do not select a conversation. Other thread
+selections remain subject to continuity validation. Unrelated clients can update or
+create sibling threads without being attributed to the mapped launch.
+
+Capture and recovery require complete evidence selecting only the mapped thread.
+Native `/new`, `/fork`, or `/resume` to another thread remain detectable even if
+the CLI returns to the mapped thread before exiting. Missing responses or a failed
+relay block automatic capture. Launches without a relay retain the conservative
+workspace snapshot check, including launches already journaled with that format.
+
 External Claude messages can be injected as real user and assistant transcript
 items without starting a Codex model turn. Synthetic tool calls are never
 fabricated; only bounded summaries of their observable effects are projected.
